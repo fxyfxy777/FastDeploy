@@ -93,9 +93,12 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous_custom_python_op(
 
     # down_proj
     ffn_in_x, ffn_in_x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
-        ffn_out, using_pow2_scale=False
+        ffn_out, using_pow2_scale=False, output_scale_transpose=False
     )
-    ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
+    ffn_in_x_scale_tensor = ffn_in_x_scale_tensor[: ffn_in_x.shape[0]]
+    ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0]).contiguous()
+    ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0])
+    
 
     ffn_out = paddle.empty(
         (permute_input.shape[0], layer_added_weight_attrs_1.shape[1]),
@@ -317,9 +320,11 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
 
             # down_proj
             ffn_in_x, ffn_in_x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
-                ffn_out, using_pow2_scale=False
+                ffn_out, using_pow2_scale=False, output_scale_transpose=False
             )
-            ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
+            ffn_in_x_scale_tensor = ffn_in_x_scale_tensor[: ffn_in_x.shape[0]]
+            ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0]).contiguous()
+            ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0])
 
             del ffn_out
             ffn_out = paddle.empty(
