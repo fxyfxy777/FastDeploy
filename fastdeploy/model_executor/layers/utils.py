@@ -244,7 +244,6 @@ def per_block_cast_to_fp8(x: Tensor, block_size: list = [128, 128]) -> Tuple[Ten
 
     x_abs = paddle.abs(x_view).astype(paddle.float32)
     x_amax = paddle.amax(x_abs, axis=(1, 3), keepdim=True)
-    x_amax = paddle.clip(x_amax, min=1e-4)
     x_scaled = (x_view * (448.0 / x_amax)).astype(paddle.float8_e4m3fn)
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (
         paddle.view(1.0 / (448.0 / x_amax), (x_view.shape[0], x_view.shape[2]))
