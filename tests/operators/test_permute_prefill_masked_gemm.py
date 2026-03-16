@@ -47,6 +47,7 @@ def call_prefill_permute_to_masked_gemm(
         topk_ids = topk_ids.cast(paddle.int64)
 
     results = prefill_permute_to_masked_gemm(x, scale, topk_ids, num_local_experts, max_token_num)
+    paddle.nn.functional.moe_permute
 
     return results[0], results[1], results[2], results[3]
 
