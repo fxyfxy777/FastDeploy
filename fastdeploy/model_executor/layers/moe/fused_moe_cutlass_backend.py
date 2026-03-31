@@ -275,8 +275,10 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
         Paddle Cutlass compute Fused MoE.
         """
         gate_out = gate(x)
-        gate_out = gate_out.cast("float32")
         if layer.topk_method == "noaux_tc":
+            use_fused = not layer.dynamic_load_weight and current_platform.is_cuda()
+            if not use_fused:
+                gate_out = gate_out.cast("float32")
             gate_out, topk_weights, topk_idx = get_moe_scores(
                 gate_out,
                 layer.n_group,
@@ -285,6 +287,7 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                 layer.routed_scaling_factor,
                 layer.gate_correction_bias,
                 getattr(layer, "renormalize", True),
+                use_fused_cast=use_fused,
             )
             (
                 permute_input,
@@ -308,6 +311,7 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                 topk_only_mode=True,
             )
         else:
+            gate_out = gate_out.cast("float32")
             (
                 permute_input,
                 token_nums_per_expert,

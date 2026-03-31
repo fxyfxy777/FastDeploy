@@ -39,7 +39,13 @@ try:
     from fastdeploy.model_executor.ops.gpu import noaux_tc, noaux_tc_redundant
 except:
     logger.warning("import noaux_tc Failed!")
+
 import numpy as np
+
+if current_platform.is_cuda():
+    from fastdeploy.model_executor.layers.moe.fused_cast_sigmoid_bias import (
+        fused_cast_sigmoid_bias,
+    )
 
 
 def get_moe_method(layer=None):
@@ -90,13 +96,17 @@ def get_moe_scores(
     expert_in_rank_num_list: paddle.Tensor = None,
     tokens_per_expert_stats_list: paddle.Tensor = None,
     redundant_ep_rank_num_plus_one: int = 1,
+    use_fused_cast: bool = False,
 ) -> paddle.Tensor:
     """
     compute moe scores using e_score_correction_bias.
     """
-    scores = paddle.nn.functional.sigmoid(gating_output)
     assert e_score_correction_bias is not None, "e_score_correction_bias is none!"
-    scores_with_bias = scores + e_score_correction_bias
+    if use_fused_cast and current_platform.is_cuda():
+        scores, scores_with_bias = fused_cast_sigmoid_bias(gating_output, e_score_correction_bias)
+    else:
+        scores = paddle.nn.functional.sigmoid(gating_output)
+        scores_with_bias = scores + e_score_correction_bias
     if expert_id_to_ep_rank_array is None:
         scores, topk_values, topk_idx = noaux_tc(
             scores,
@@ -163,6 +173,7 @@ class FusedMoE(nn.Layer):
         super().__init__()
 
         self.fd_config = fd_config
+        self.dynamic_load_weight = fd_config.load_config.dynamic_load_weight
         self.layer_idx = layer_idx
         self.reduce_results = reduce_results
         self.renormalize = renormalize
