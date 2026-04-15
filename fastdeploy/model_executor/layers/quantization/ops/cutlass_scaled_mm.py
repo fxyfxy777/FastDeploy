@@ -67,7 +67,9 @@ def cutlass_scaled_mm(
     )
 
     out = paddle.empty([m, n], dtype=out_dtype)
-    fastdeploy.model_executor.ops.gpu.cutlass_scaled_mm(out, a, b, scale_a, scale_b, bias)
+    # fastdeploy.model_executor.ops.gpu.cutlass_scaled_mm(out, a, b, scale_a, scale_b, bias)
+    import cutlass_scaled_mm_paddle
+    out = cutlass_scaled_mm_paddle.cutlass_scaled_mm(a, b, scale_a, scale_b, bias)
 
     return out
 

@@ -261,6 +261,17 @@ async def async_request_eb_openai_chat_completions(
     output.prompt_len = 0
     output.no = request_func_input.no
     payload["no"] = request_func_input.no
+
+    # 打印前3条请求的 messages 结构，用于验证全量上下文是否正确传入
+    if request_func_input.no <= 3:
+        msgs = payload.get("messages", [])
+        roles = [m["role"] for m in msgs]
+        print(f"\n[DEBUG req#{request_func_input.no}] messages总条数={len(msgs)}, roles={roles}")
+        for idx, m in enumerate(msgs):
+            content_preview = str(m.get("content", ""))[:120].replace("\n", " ")
+            print(f"  msg[{idx}] role={m['role']}  content={content_preview}...")
+        print(f"  max_tokens={payload.get('max_tokens')}  tools={'有' if payload.get('tools') else '无'}\n")
+
     if request_func_input.debug:
         print(f"payload:{json.dumps(payload, ensure_ascii=False)}")
     metrics_list = []

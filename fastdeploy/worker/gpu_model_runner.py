@@ -105,6 +105,20 @@ from fastdeploy.worker.model_runner_base import (
 )
 from fastdeploy.worker.output import LogprobsTensors, ModelOutputData, ModelRunnerOutput
 
+# ── CUDA profiling helpers ─────────────────────────────────────────────────
+# NVTX:  paddle.cuda.nvtx.range_push/pop
+# nsys:  paddle.cuda.cudart().cudaProfilerStart/Stop
+# guard: paddle.cuda.is_current_stream_capturing() — CUDA graph capture 时跳过
+
+def _nvtx_push(name: str):
+    if not paddle.cuda.is_current_stream_capturing():
+        paddle.cuda.nvtx.range_push(name)
+
+def _nvtx_pop():
+    if not paddle.cuda.is_current_stream_capturing():
+        paddle.cuda.nvtx.range_pop()
+# ──────────────────────────────────────────────────────────────────────────
+
 
 class GPUModelRunner(ModelRunnerBase):
     def __init__(
@@ -272,6 +286,35 @@ class GPUModelRunner(ModelRunnerBase):
         if self.enable_overlap_schedule:
             logger.info("Using overlap schedule")
         self.current_launch_token_num = 0
+
+        # ── nsys / NVTX profiling ─────────────────────────────────────────────
+        # 用法: PROF_BUCKET=medium nsys profile --capture-range=cudaProfilerApi ...
+        # 可选值: short / medium / long，不设置则不抓
+        # 抓够 steps 步后调 os._exit(0) 退出，nsys 自然写出文件
+        self.forward_pass_id = 0
+        self._decode_step_cnt = 0
+        self._extend_step_cnt = 0
+        _all_buckets = {
+            "short":  {"lo": 20000, "hi": 35000, "steps": 10},
+            "medium": {"lo": 45000, "hi": 50000, "steps": 10},
+            "long":   {"lo": 55000, "hi": 60000, "steps": 10},
+        }
+        _target = os.environ.get("PROF_BUCKET", "").strip().lower()
+        if _target in _all_buckets:
+            cfg = _all_buckets[_target]
+            self._prof_buckets = {
+                _target: {
+                    "lo": cfg["lo"], "hi": cfg["hi"],
+                    "steps": cfg["steps"],
+                    "done": False, "active": False, "cnt": 0,
+                },
+            }
+            logger.info(f"[PROF] 目标桶={_target}  avg_seq_len 范围=[{cfg['lo']}, {cfg['hi']})")
+        else:
+            self._prof_buckets = {}
+            if _target:
+                logger.warning(f"[PROF] PROF_BUCKET={_target!r} 不合法，跳过 profiling")
+        # ─────────────────────────────────────────────────────────────────────
 
     def _async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
@@ -2027,10 +2070,83 @@ class GPUModelRunner(ModelRunnerBase):
             intermediate_tensors:
             num_running_requests: batch_size
         """
+        
+        capturing = paddle.cuda.is_current_stream_capturing()
+        if not capturing:
+            self.forward_pass_id += 1
+            bs = num_running_requests or 0
+            is_prefill = self.exist_prefill_flag
+            _mode = "extend" if is_prefill else "decode"
+            if is_prefill:
+                self._extend_step_cnt += 1
+            else:
+                self._decode_step_cnt += 1
+
+            # avg_token: 从 forward_batch_reqs_list 取真实 Request 对象
+            # num_total_tokens = prompt_token_ids_len + len(output_token_ids)，纯 CPU，无 GPU sync
+            if bs > 0:
+                total_lens = [
+                    req.num_total_tokens
+                    for req in self.forward_batch_reqs_list[:bs]
+                    if req is not None
+                ]
+                avg_token = int(sum(total_lens) / len(total_lens)) if total_lens else 0
+            else:
+                avg_token = 0
+
+            # ── NVTX range ────────────────────────────────────────────────────
+            paddle.cuda.nvtx.range_push(
+                f"execute_model pass={self.forward_pass_id}"
+                f" mode={_mode}"
+                f" bs={bs}"
+                f" avg_token={avg_token}"
+            )
+
+            # ── PROF_BUCKET: decode 阶段在指定 avg_token 范围内触发 nsys 抓包 ──
+            # 用法: PROF_BUCKET=medium nsys profile --capture-range=cudaProfilerApi ...
+            if not is_prefill and self._prof_buckets:
+                _cudart = paddle.cuda.cudart()
+                for bname, bcfg in self._prof_buckets.items():
+                    if bcfg["done"]:
+                        continue
+                    if bcfg["active"]:
+                        bcfg["cnt"] += 1
+                        if bcfg["cnt"] >= bcfg["steps"]:
+                            _cudart.cudaProfilerStop()
+                            bcfg["done"] = True
+                            logger.info(
+                                f"[PROF] STOP  bucket={bname}"
+                                f"  decode_step={self._decode_step_cnt}"
+                                f"  captured_steps={bcfg['cnt']}"
+                                f"  → os._exit(0)"
+                            )
+                            os._exit(0)
+                    elif bs == 64 and bcfg["lo"] <= avg_token < bcfg["hi"]:
+                        bcfg["active"] = True
+                        bcfg["cnt"] = 1
+                        _cudart.cudaProfilerStart()
+                        logger.info(
+                            f"[PROF] START bucket={bname}"
+                            f"  decode_step={self._decode_step_cnt}"
+                            f"  bs={bs}  avg_token={avg_token}"
+                        )
+                    else:
+                        if self._decode_step_cnt % 50 == 0:
+                            logger.info(
+                                f"[PROF] waiting bucket={bname}"
+                                f"  decode_step={self._decode_step_cnt}"
+                                f"  bs={bs} (need 64)"
+                                f"  avg_token={avg_token}"
+                                f"  target=[{bcfg['lo']}, {bcfg['hi']})"
+                            )
+
         if not self.enable_overlap_schedule:
             self.execute_model_normal(model_forward_batch, num_running_requests)
         else:
             self.execute_model_overlap(model_forward_batch, num_running_requests)
+
+        if not capturing:
+            paddle.cuda.nvtx.range_pop()
 
     def execute_model_normal(
         self,
@@ -2135,10 +2251,13 @@ class GPUModelRunner(ModelRunnerBase):
 
     def _execute(self, model_inputs: Dict[str, paddle.Tensor]) -> None:
         if model_inputs is not None and len(model_inputs) > 0:
+            capturing = paddle.cuda.is_current_stream_capturing()
+
             model_output = self.model(
                 model_inputs,
                 self.forward_meta,
             )
+
             if self.use_cudagraph:
                 model_output = model_output[: self.real_token_num]
         else:

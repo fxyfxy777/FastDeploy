@@ -132,7 +132,7 @@ def flash_attn_func(
         init_flash_attn_version()
     if version is None:
         version = FLASH_ATTN_VERSION
-
+    print("version:",version)
     if version == 4:
         assert (
             flashmask_attention_v4 is not None
@@ -146,6 +146,8 @@ def flash_attn_func(
         with paddle.no_grad():
             try:
                 paddle.set_flags({"FLAGS_flash_attn_version": 4})
+                attn_mask_q = attn_mask_q[:,:,:,[0,3]]
+                print("fa4")
                 out = flashmask_attention_v4(
                     q.reshape([1, -1, num_heads, head_dim]),
                     k.reshape([1, -1, kv_num_heads, head_dim]),
