@@ -15,6 +15,7 @@
 """
 
 import copy
+import os
 import threading
 import time
 import traceback
@@ -230,6 +231,18 @@ class ResourceManagerV1(ResourceManager):
         self.can_relax_prefill_strategy = True
         # Scheduler-side requests that have not been moved into resource manager waiting queue yet.
         self.scheduler_unhandled_request_num = 0
+
+        # ── Prefill batching: defer single prefill to accumulate more ──
+        # min_prefill_batch: if waiting prefill count < this, defer scheduling
+        # prefill_batch_max_wait_s: max time (seconds) to defer before force scheduling
+        self._min_prefill_batch = int(os.environ.get("FD_MIN_PREFILL_BATCH", "1"))
+        self._prefill_batch_max_wait_s = float(os.environ.get("FD_PREFILL_BATCH_MAX_WAIT_S", "0.0"))
+        self._prefill_defer_start_time = None  # timestamp when deferral began
+        if self._min_prefill_batch > 1:
+            llm_logger.info(
+                f"Prefill batching enabled: min_prefill_batch={self._min_prefill_batch}, "
+                f"max_wait={self._prefill_batch_max_wait_s * 1000:.1f}ms"
+            )
 
     def allocated_slots(self, request: Request):
         return len(request.block_tables) * self.config.cache_config.block_size
@@ -949,7 +962,47 @@ class ResourceManagerV1(ResourceManager):
                 self.running.remove(request)
 
             # Second, schedule the WAITING requests.
-            if not preempted_reqs:
+            # ── Prefill batching: defer if not enough waiting requests ──
+            # Only defer when Phase 1 produced a pure-decode batch (no prefill from chunked continuation).
+            # If Phase 1 already injected a prefill task, the batch is already mixed (no CUDA Graph),
+            # so we should pile on more prefill rather than deferring.
+            _defer_prefill = False
+            _phase1_has_prefill = any(
+                getattr(r, "task_type", None) == RequestType.PREFILL for r in scheduled_reqs
+            )
+            if (
+                self._min_prefill_batch > 1
+                and not preempted_reqs
+                and self.waiting
+                and self.running
+                and not _phase1_has_prefill  # batch is still pure decode, worth deferring
+            ):
+                waiting_new_count = sum(
+                    1 for r in self.waiting
+                    if r.status == RequestStatus.WAITING or r.status == RequestStatus.PREEMPTED
+                )
+                if waiting_new_count > 0 and waiting_new_count < self._min_prefill_batch:
+                    # Not enough prefill requests yet
+                    if self._prefill_defer_start_time is None:
+                        self._prefill_defer_start_time = time.time()
+                    elapsed = time.time() - self._prefill_defer_start_time
+                    if elapsed < self._prefill_batch_max_wait_s:
+                        _defer_prefill = True
+                        llm_logger.debug(
+                            f"Prefill batching: deferring {waiting_new_count} prefill(s), "
+                            f"elapsed={elapsed * 1000:.1f}ms / max={self._prefill_batch_max_wait_s * 1000:.1f}ms"
+                        )
+                    else:
+                        llm_logger.debug(
+                            f"Prefill batching: timeout, force scheduling {waiting_new_count} prefill(s) "
+                            f"after {elapsed * 1000:.1f}ms"
+                        )
+                        self._prefill_defer_start_time = None
+                else:
+                    # Enough requests or none waiting, reset
+                    self._prefill_defer_start_time = None
+
+            if not preempted_reqs and not _defer_prefill:
                 skip_requests: list[Request] = []
                 while self.waiting and token_budget > 0:
                     if (
