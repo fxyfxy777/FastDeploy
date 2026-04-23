@@ -14,6 +14,7 @@
 # limitations under the License.
 """
 
+import collections
 import copy
 import os
 import threading
@@ -242,6 +243,101 @@ class ResourceManagerV1(ResourceManager):
             llm_logger.info(
                 f"Prefill batching enabled: min_prefill_batch={self._min_prefill_batch}, "
                 f"max_wait={self._prefill_batch_max_wait_s * 1000:.1f}ms"
+            )
+
+        # ── Adaptive prefill batching ──
+        # When FD_ADAPTIVE_PREFILL_BATCH=1, automatically adjust min_prefill_batch
+        # and prefill_batch_max_wait_s based on runtime statistics.
+        self._adaptive_prefill_batch = os.environ.get("FD_ADAPTIVE_PREFILL_BATCH", "0") == "1"
+        if self._adaptive_prefill_batch:
+            # Force enable prefill batching with initial conservative params
+            if self._min_prefill_batch <= 1:
+                self._min_prefill_batch = 2
+            if self._prefill_batch_max_wait_s <= 0.0:
+                self._prefill_batch_max_wait_s = 0.1
+            # Sliding window to track batch attempts: True=success(batched), False=timeout
+            self._prefill_batch_history = collections.deque(maxlen=50)
+            # Track request arrival times for interval estimation
+            self._prefill_arrival_times = collections.deque(maxlen=20)
+            # Counter for periodic re-evaluation
+            self._adapt_eval_counter = 0
+            self._adapt_eval_interval = 50  # re-evaluate every N attempts
+            # Bounds
+            self._adapt_min_min = 2
+            self._adapt_max_min = 5
+            self._adapt_min_wait = 0.02   # 20ms floor
+            self._adapt_max_wait = 0.5    # 500ms ceiling
+            llm_logger.info(
+                f"Adaptive prefill batching enabled: initial min_prefill_batch={self._min_prefill_batch}, "
+                f"initial max_wait={self._prefill_batch_max_wait_s * 1000:.1f}ms"
+            )
+
+    # ── Adaptive prefill batching helpers ──
+
+    def _record_prefill_batch_attempt(self, success: bool, waiting_new_count: int):
+        """Record a prefill batch attempt result for adaptive tuning.
+
+        Args:
+            success: True if batched enough requests before timeout, False if timed out.
+            waiting_new_count: number of waiting prefill requests at this attempt.
+        """
+        if not self._adaptive_prefill_batch:
+            return
+        self._prefill_batch_history.append(success)
+        # Record arrival: each waiting request represents a recent arrival
+        now = time.time()
+        if waiting_new_count > 0:
+            self._prefill_arrival_times.append(now)
+        # Periodically re-evaluate parameters
+        self._adapt_eval_counter += 1
+        if self._adapt_eval_counter >= self._adapt_eval_interval:
+            self._adapt_eval_counter = 0
+            self._adapt_prefill_batch_params()
+
+    def _adapt_prefill_batch_params(self):
+        """Adjust min_prefill_batch and max_wait based on recent history."""
+        if len(self._prefill_batch_history) < 10:
+            return  # not enough data yet
+
+        success_rate = sum(self._prefill_batch_history) / len(self._prefill_batch_history)
+
+        old_min = self._min_prefill_batch
+        old_wait = self._prefill_batch_max_wait_s
+
+        # ── Adjust based on success rate ──
+        if success_rate > 0.8:
+            # Requests are dense, easy to batch → try more aggressive
+            self._min_prefill_batch = min(self._min_prefill_batch + 1, self._adapt_max_min)
+        elif success_rate < 0.3:
+            # Most attempts timeout → be more conservative
+            if self._min_prefill_batch > self._adapt_min_min:
+                self._min_prefill_batch -= 1
+            else:
+                # MIN already at floor, shrink wait time instead
+                self._prefill_batch_max_wait_s = max(
+                    self._prefill_batch_max_wait_s * 0.5,
+                    self._adapt_min_wait,
+                )
+
+        # ── Adjust wait time based on arrival interval ──
+        if len(self._prefill_arrival_times) >= 2:
+            arrivals = list(self._prefill_arrival_times)
+            intervals = [arrivals[i + 1] - arrivals[i] for i in range(len(arrivals) - 1)]
+            avg_interval = sum(intervals) / len(intervals)
+            # Ideal wait = enough time to accumulate (MIN - 1) more requests
+            ideal_wait = avg_interval * (self._min_prefill_batch - 1) * 1.5  # 1.5x safety factor
+            ideal_wait = max(self._adapt_min_wait, min(ideal_wait, self._adapt_max_wait))
+            # Smooth towards ideal: move 30% of the gap each evaluation
+            self._prefill_batch_max_wait_s += 0.3 * (ideal_wait - self._prefill_batch_max_wait_s)
+            self._prefill_batch_max_wait_s = max(
+                self._adapt_min_wait, min(self._prefill_batch_max_wait_s, self._adapt_max_wait)
+            )
+
+        if old_min != self._min_prefill_batch or abs(old_wait - self._prefill_batch_max_wait_s) > 0.001:
+            llm_logger.info(
+                f"Adaptive prefill batch adjusted: min_prefill_batch {old_min}->{self._min_prefill_batch}, "
+                f"max_wait {old_wait * 1000:.1f}ms->{self._prefill_batch_max_wait_s * 1000:.1f}ms "
+                f"(success_rate={success_rate:.2f}, history_len={len(self._prefill_batch_history)})"
             )
 
     def allocated_slots(self, request: Request):
@@ -998,9 +1094,14 @@ class ResourceManagerV1(ResourceManager):
                             f"after {elapsed * 1000:.1f}ms"
                         )
                         self._prefill_defer_start_time = None
+                        # Adaptive: record timeout (failed to batch)
+                        self._record_prefill_batch_attempt(success=False, waiting_new_count=waiting_new_count)
                 else:
                     # Enough requests or none waiting, reset
                     self._prefill_defer_start_time = None
+                    # Adaptive: record success (batched enough)
+                    if waiting_new_count >= self._min_prefill_batch:
+                        self._record_prefill_batch_attempt(success=True, waiting_new_count=waiting_new_count)
 
             if not preempted_reqs and not _defer_prefill:
                 skip_requests: list[Request] = []
