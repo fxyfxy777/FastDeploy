@@ -152,6 +152,19 @@ class GPUModelRunner(ModelRunnerBase):
         self.cache_kvs_map: dict = {}
         self.exist_prefill_flag = False
 
+        # --- step timing stats (CUDA-event based) ---
+        self._timing_enabled = bool(int(os.getenv("FD_ENABLE_STEP_TIMING", "0")))
+        self._step_count = 0
+        self._prefill_total_ms = 0.0
+        self._decode_total_ms = 0.0
+        self._prefill_steps = 0
+        self._decode_steps = 0
+        self._timing_log_interval = int(os.getenv("FD_STEP_TIMING_LOG_INTERVAL", "50"))
+        self._pending_timing = None
+        self._last_step_is_prefill = True
+        self.ii = 0
+        self._profiling = False  # True while nvprof capture is active
+
         self.is_kvcache_sleeping = False
         self.is_weight_sleeping = False
 
@@ -2120,10 +2133,72 @@ class GPUModelRunner(ModelRunnerBase):
             intermediate_tensors:
             num_running_requests: batch_size
         """
+        if self._timing_enabled:
+            # 收集上一步的计时结果（此时 GPU 早已完成，query 不阻塞）
+            if self._pending_timing is not None:
+                prev_start, prev_end = self._pending_timing
+                prev_is_prefill = self._last_step_is_prefill
+                self._last_step_is_prefill = self.exist_prefill_flag
+                elapsed_ms = prev_start.elapsed_time(prev_end)
+                self._step_count += 1
+                if prev_is_prefill:
+                    self._prefill_total_ms += elapsed_ms
+                    self._prefill_steps += 1
+                else:
+                    self._decode_total_ms += elapsed_ms
+                    self._decode_steps += 1
+                if self._step_count % self._timing_log_interval == 0:
+                    total_ms = self._prefill_total_ms + self._decode_total_ms
+                    pct_p = self._prefill_total_ms / total_ms * 100 if total_ms > 0 else 0
+                    pct_d = self._decode_total_ms / total_ms * 100 if total_ms > 0 else 0
+                    msg = f"[StepTiming] step={self._step_count} | total={total_ms:.1f}ms"
+                    msg += f" | prefill: {pct_p:.1f}% total={self._prefill_total_ms:.1f}ms avg={self._prefill_total_ms / max(self._prefill_steps, 1):.2f}ms ({self._prefill_steps} steps)"
+                    msg += f" | decode: {pct_d:.1f}% total={self._decode_total_ms:.1f}ms avg={self._decode_total_ms / max(self._decode_steps, 1):.2f}ms ({self._decode_steps} steps)"
+                    print(msg, flush=True)
+
+            start_event = paddle.device.cuda.Event(enable_timing=True)
+            end_event = paddle.device.cuda.Event(enable_timing=True)
+            start_event.record()
+
+        ids_count = self.forward_meta.ids_remove_padding.shape[0]
+
+        capturing = paddle.cuda.is_current_stream_capturing()
+        if not capturing:
+            bs = num_running_requests or 0
+            _mode = "prefill" if self.exist_prefill_flag else "decode"
+            total_lens = [req.num_total_tokens for req in self.forward_batch_reqs_list[:bs] if req is not None]
+            avg_token = int(sum(total_lens) / len(total_lens)) if total_lens else 0
+            paddle.cuda.nvtx.range_push(f"execute_model mode={_mode} bs={bs} avg_token={avg_token}")
+
         if not self.enable_overlap_schedule:
             self.execute_model_normal(model_forward_batch, num_running_requests)
         else:
             self.execute_model_overlap(model_forward_batch, num_running_requests)
+
+        if not capturing:
+            paddle.cuda.nvtx.range_pop()
+
+        # File-based profiling control: echo start/stop > /tmp/fd_prof.ctrl
+        _PROF_CTRL = "/tmp/fd_prof.ctrl"
+        try:
+            with open(_PROF_CTRL) as _f:
+                _cmd = _f.read().strip()
+            if _cmd == "start" and not self._profiling:
+                from paddle.framework import core; core.nvprof_start()
+                self._profiling = True
+                print(f"[PROF_START] nvprof_start", flush=True)
+                with open(_PROF_CTRL, "w") as _f: _f.write("running\n")
+            elif _cmd == "stop" and self._profiling:
+                from paddle.framework import core; core.nvprof_stop()
+                self._profiling = False
+                print(f"[PROF_STOP] nvprof_stop", flush=True)
+                import os; os.remove(_PROF_CTRL)
+        except FileNotFoundError:
+            pass
+
+        if self._timing_enabled:
+            end_event.record()
+            self._pending_timing = (start_event, end_event)
 
     def execute_model_normal(
         self,
