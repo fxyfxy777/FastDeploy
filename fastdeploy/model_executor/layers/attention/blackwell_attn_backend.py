@@ -117,6 +117,11 @@ class BlackwellAttentionBackend(AttentionBackend):
         self.num_layers = fd_config.model_config.num_hidden_layers
         self.rank, self.device_id = init_rank_and_device_id(fd_config)
 
+        # Pre-allocate identity rotary (cos=1, sin=0) for decode path
+        identity_rotary = paddle.zeros([2, self.max_seq_len, self.head_dim // 2], dtype="float32")
+        identity_rotary[0, :, :] = 1.0  # cos = 1
+        self._identity_rotary = identity_rotary
+
     def get_kv_cache_shape(self, max_num_blocks: int, kv_cache_quant_type: str = None):
         shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
         return shape, shape
@@ -124,16 +129,21 @@ class BlackwellAttentionBackend(AttentionBackend):
     def get_attention_meta(self):
         return self.attention_metadata
 
-    def _rotary_embs_for_blackwell(self, rotary_embs: paddle.Tensor) -> paddle.Tensor:
+    def _rotary_embs_for_encoder(self, rotary_embs: paddle.Tensor) -> paddle.Tensor:
         """
-        blackwell_ops expects [2, max_seq_len, head_dim/2].
-        neox style (FastDeploy default) produces [2, 1, max_seq_len, 1, head_dim/2].
+        Encoder kernel (neox native) expects [2, max_seq_len, rotary_dim/2].
+        FastDeploy produces [2, 1, max_seq_len, 1, rotary_dim/2]. Just squeeze.
+        """
+        if rotary_embs.ndim == 5:
+            rotary_embs = rotary_embs.squeeze([1, 3])  # [2, max_seq_len, rotary_dim/2]
+        return rotary_embs
 
-        When partial_rotary_factor < 1.0 (e.g. GLM4: factor=0.5, rotary_dim=64,
-        head_dim=128), FastDeploy only stores rotary_dim/2=32 cos/sin values.
-        The blackwell kernel always strides by head_dim/2=64, so we must pad:
-          cos part: fill remaining entries with 1.0 (identity rotation)
-          sin part: fill remaining entries with 0.0 (identity rotation)
+    def _rotary_embs_for_decoder(self, rotary_embs: paddle.Tensor) -> paddle.Tensor:
+        """
+        Decoder kernel (GPT-J style) expects [2, max_seq_len, head_dim/2].
+        When partial_rotary_factor < 1.0 (e.g. GLM4: rotary_dim=64, head_dim=128),
+        FastDeploy only stores rotary_dim/2=32 values. Pad to head_dim/2=64:
+          cos pad with 1.0 (identity), sin pad with 0.0 (identity).
         """
         if rotary_embs.ndim == 5:
             rotary_embs = rotary_embs.squeeze([1, 3])  # [2, max_seq_len, rotary_dim/2]
@@ -185,12 +195,14 @@ class BlackwellAttentionBackend(AttentionBackend):
                 paddle.cumsum(pf_enc_lens).cast("int32"),
             ])
 
-            # Causal position mask (1-indexed) reuses ids_remove_padding
-            pf_mask_t = paddle.gather(
-                forward_meta.ids_remove_padding.cast("int32"), pf_ei
-            ) + 1  # [pf_et]
-
             meta.pf_et      = int(pf_enc_lens.sum().item())
+
+            # Causal mask: 1-indexed position of each token within its sequence
+            # e.g. for two seqs of len 3 and 5: [1,2,3, 1,2,3,4,5]
+            pf_positions = paddle.arange(meta.pf_et, dtype="int32")
+            batch_of_token = paddle.searchsorted(pf_cu[1:], pf_positions, right=True)
+            token_seq_start = paddle.gather(pf_cu, batch_of_token.cast("int64"))
+            pf_mask_t = (pf_positions - token_seq_start + 1).cast("int32")  # [pf_et]
             meta.pf_max_enc = int(pf_enc_lens.max().item())
             meta.pf_ei      = pf_ei
             meta.pf_cu_q    = pf_cu
@@ -275,27 +287,16 @@ class BlackwellAttentionBackend(AttentionBackend):
         # Unpack: [total_tokens, (nH+2*nKVH)*hd] -> [total_tokens, nH+2*nKVH, hd]
         qkv_3d = qkv.reshape([total_tokens, nH + 2 * nKVH, hd]).cast(D_type)
 
-        # blackwell_ops uses GPT-J adjacent-pair rotation; FastDeploy default is neox
-        # (first-half / second-half split).  Convert Q and K heads from neox to GPT-J
-        # layout so RoPE results match: [a0..a_{hd/2-1}, b0..b_{hd/2-1}] ->
-        # [a0,b0, a1,b1, ..., a_{hd/2-1}, b_{hd/2-1}]
-        if getattr(layer, "use_neox_rotary_style", True):
-            qk_3d = qkv_3d[:, :nH + nKVH, :]   # [T, nH+nKVH, hd]
-            # reshape to [T, nH+nKVH, 2, hd/2], swap last two dims, reshape back
-            qk_gptj = qk_3d.reshape([total_tokens, nH + nKVH, 2, hd // 2]) \
-                            .transpose([0, 1, 3, 2]) \
-                            .reshape([total_tokens, nH + nKVH, hd])
-            qkv_3d = paddle.concat([qk_gptj, qkv_3d[:, nH + nKVH:, :]], axis=1)
-
-        rotary_embs  = self._rotary_embs_for_blackwell(forward_meta.rotary_embs)
         block_tables = forward_meta.block_tables
 
         result = paddle.zeros([total_tokens, nH * hd], dtype=D_type)
 
-        # ── Prefill path ──────────────────────────────────────────────────────
+        # ── Prefill path (encoder kernel: neox native, no data conversion) ────
         if meta.pf_ei is not None:
             pf_qkv = paddle.index_select(qkv_3d,      meta.pf_ei,   axis=0)
             bt_pf  = paddle.index_select(block_tables, meta.pf_bidx, axis=0)
+
+            rotary_embs_enc = self._rotary_embs_for_encoder(forward_meta.rotary_embs)
 
             # RoPE + write KV cache; static_op returns (q_e, k_e, v_e) as tensors
             q_e = paddle.empty([meta.pf_et, nH,   hd], dtype=D_type)
@@ -303,7 +304,7 @@ class BlackwellAttentionBackend(AttentionBackend):
             v_e = paddle.empty([meta.pf_et, nKVH, hd], dtype=D_type)
             q_e, k_e, v_e = blackwell_ops.static_op_flash_attn_write_cache_kv_encoder(
                 pf_qkv, meta.pf_cu_q, meta.pf_cu_q,
-                rotary_embs,
+                rotary_embs_enc,
                 meta.pf_sl_enc, meta.pf_sl_dec,
                 cache_k, cache_v, bt_pf,
                 q_e, k_e, v_e,
@@ -319,24 +320,76 @@ class BlackwellAttentionBackend(AttentionBackend):
                 q_e, k_e, v_e,
                 meta.pf_cu_q, meta.pf_cu_q,
                 enc_out,
-                meta.pf_mask,
+                None,  # standard causal mask (text-only model)
             )
 
             result = paddle.scatter(result, meta.pf_ei, enc_out.reshape([meta.pf_et, nH * hd]))
 
-        # ── Decode path ───────────────────────────────────────────────────────
+        # ── Decode path ──────────────────────────────────────────────────────
+        # The encoder kernel stores K to cache in neox element order with neox
+        # RoPE.  The decoder kernel (write_cache_kv_decoder) internally uses
+        # GPT-J style RoPE which changes the element order when combined with
+        # the Python neox→gptj conversion.  To keep cache K consistent between
+        # prefill-written and decode-written blocks, we:
+        #   1. Apply neox RoPE to Q/K in Python (matching the encoder).
+        #   2. Pass identity rotary_embs (cos=1, sin=0) to the decoder kernel
+        #      so it only does GQA packing of Q and K/V cache write without
+        #      modifying values.
         if meta.dc_di is not None:
             dc_qkv = paddle.index_select(qkv_3d,      meta.dc_di,   axis=0)
             bt_dc  = paddle.index_select(block_tables, meta.dc_bidx, axis=0)
 
-            # RoPE + write new K/V to cache; static_op returns (q_dec, q_dequant_scale)
+            # Apply neox RoPE in Python for Q and K heads
+            rotary_embs_raw = forward_meta.rotary_embs  # [2, 1, max_seq_len, 1, rotary_dim/2] or [2, max_seq_len, rotary_dim/2]
+            if rotary_embs_raw.ndim == 5:
+                rotary_embs_2d = rotary_embs_raw.squeeze([1, 3])  # [2, max_seq_len, rotary_dim/2]
+            else:
+                rotary_embs_2d = rotary_embs_raw
+            half_rot = rotary_embs_2d.shape[-1]  # rotary_dim / 2
+            rotary_dim = half_rot * 2
+
+            # Gather per-token cos/sin based on position (= cached history length)
+            # dc_sl_kv_dec[i] = position of new token for decode batch item i
+            positions = meta.dc_sl_kv_dec  # [ndc] int32, positions for each decode seq
+            # Expand positions per token: for each token, its position = seq_pos + offset_within_seq
+            # For standard decode (1 token/seq, dc_max_new==1): tok_positions = positions directly
+            if meta.dc_max_new == 1:
+                tok_positions = positions  # [ndc] = [dc_dt]
+            else:
+                # Multi-token decode: build per-token positions via GPU ops
+                dc_new_lens = paddle.diff(meta.dc_cu_q)  # [ndc] int32
+                # token_seq_id[t] = which seq this token belongs to
+                token_seq_id = paddle.searchsorted(meta.dc_cu_q[1:], paddle.arange(meta.dc_dt, dtype="int32"), right=True)
+                # offset within seq
+                token_offset = paddle.arange(meta.dc_dt, dtype="int32") - paddle.gather(meta.dc_cu_q, token_seq_id.cast("int64")).cast("int32")
+                tok_positions = paddle.gather(positions, token_seq_id.cast("int64")).cast("int32") + token_offset
+
+            # cos/sin: [dc_dt, half_rot]
+            cos_all = paddle.index_select(rotary_embs_2d[0], tok_positions.cast("int64"), axis=0)  # [dc_dt, half_rot]
+            sin_all = paddle.index_select(rotary_embs_2d[1], tok_positions.cast("int64"), axis=0)  # [dc_dt, half_rot]
+
+            # Apply neox RoPE to Q and K (compute in float32, cast back to D_type)
+            qk_dc = dc_qkv[:, :nH + nKVH, :]  # [dc_dt, nH+nKVH, hd]
+            first_half  = qk_dc[:, :, :half_rot].cast("float32")           # [dc_dt, nH+nKVH, half_rot]
+            second_half = qk_dc[:, :, half_rot:rotary_dim].cast("float32") # [dc_dt, nH+nKVH, half_rot]
+            cos_e = cos_all.unsqueeze(1)  # [dc_dt, 1, half_rot]
+            sin_e = sin_all.unsqueeze(1)  # [dc_dt, 1, half_rot]
+            new_first  = (first_half * cos_e - second_half * sin_e).cast(D_type)
+            new_second = (second_half * cos_e + first_half * sin_e).cast(D_type)
+            if rotary_dim < hd:
+                qk_dc = paddle.concat([new_first, new_second, qk_dc[:, :, rotary_dim:]], axis=-1)
+            else:
+                qk_dc = paddle.concat([new_first, new_second], axis=-1)
+            dc_qkv = paddle.concat([qk_dc, dc_qkv[:, nH + nKVH:, :]], axis=1)
+
+            # GQA packing + K/V cache write (no RoPE applied by kernel)
             q_dec, _ = blackwell_ops.static_op_flash_attn_write_cache_kv_decoder(
                 dc_qkv, meta.dc_cu_q,
                 meta.dc_sl_kv_enc, meta.dc_sl_kv_dec,
-                rotary_embs,
+                self._identity_rotary,
                 cache_k, cache_v, bt_dc,
                 None,                          # kv_dequant_scale
-                q_norm_weight, k_norm_weight,
+                None, None,                    # no norm in kernel (already done or not needed)
                 nH, nKVH, hd,
                 self.max_seq_len,
                 cache_quant_type_str,
