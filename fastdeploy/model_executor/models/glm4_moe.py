@@ -52,6 +52,17 @@ from fastdeploy.model_executor.models.model_base import (
 )
 
 
+import paddle.nn as nn
+_orig_layer_call = nn.Layer.__call__
+_orig = _orig_layer_call
+def _nvtx_call(self_layer, *a, **kw):
+    paddle.cuda.nvtx.range_push(self_layer.__class__.__name__)
+    out = _orig(self_layer, *a, **kw)
+    paddle.cuda.nvtx.range_pop()
+    return out
+nn.Layer.__call__ = _nvtx_call
+
+
 class Glm4MoeMLP(nn.Layer):
     """ """
 

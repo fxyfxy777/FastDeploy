@@ -2318,6 +2318,10 @@ class GPUModelRunner(ModelRunnerBase):
         )
         return model_output_data, sampler_output
 
+    # Profiling: PROFILE_ITERS=30 nsys profile --capture-range=cudaProfilerApi ...
+    _prof_cnt: int = 0
+    _prof_state: int = 0  # 0=waiting, 1=capturing, 2=done
+
     def execute_model(
         self,
         model_forward_batch: Optional[List[Request]] = None,
@@ -2379,7 +2383,52 @@ class GPUModelRunner(ModelRunnerBase):
         model_inputs, p_done_idxs, token_num_event = self._preprocess(
             model_forward_batch, num_running_requests, self._cached_launch_token_num, self._cached_real_bsz
         )
+<<<<<<< Updated upstream
+        real_bsz = (self.share_inputs["seq_lens_this_time_cpu"].numpy() > 0).sum().item()
+        # --- profile ---
+        import os
+        _pi = int(os.getenv("PROFILE_ITERS", "0"))
+        reqs = [r for r in self.forward_batch_reqs_list[:real_bsz] if r is not None]
+        avg_tok = int(sum(r.num_total_tokens for r in reqs) / max(len(reqs), 1))
+        logger.info(f"[Profile] prefill_flag={self.exist_prefill_flag}, real_bsz={real_bsz}, avg_tok={avg_tok}, state={self._prof_state}, cnt={self._prof_cnt}")
+
+        if _pi > 0:
+            if self._prof_state < 2 and real_bsz > 63 and self.exist_prefill_flag:
+=======
+
+        # --- profile ---
+        import os
+        _pi = int(os.getenv("PROFILE_ITERS", "0"))
+        
+
+        if _pi > 0:
+            real_bsz = (self.share_inputs["seq_lens_this_time_cpu"].numpy() > 0).sum().item()
+            reqs = [r for r in self.forward_batch_reqs_list[:real_bsz] if r is not None]
+            avg_tok = int(sum(r.num_total_tokens for r in reqs) / max(len(reqs), 1))
+            logger.info(f"[Profile] prefill_flag={self.exist_prefill_flag}, real_bsz={real_bsz}, avg_tok={avg_tok}, state={self._prof_state}, cnt={self._prof_cnt}")
+            if self._prof_state < 2 and real_bsz > 23 and self.exist_prefill_flag:
+>>>>>>> Stashed changes
+                from paddle.framework import core
+                if self._prof_state == 0:
+                    core.nvprof_start()
+                    self._prof_state = 1
+                    logger.info("[Profile] >>> START")
+            if self._prof_state == 1:
+                logger.info("[Profile] >>> COUNT")
+                self._prof_cnt += 1
+                tag = "prefill" if self.exist_prefill_flag else "decode"
+                paddle.cuda.nvtx.range_push(f"{tag}_bs{real_bsz}_avg{avg_tok}_step{self._prof_cnt}")
+        # --- end profile pre ---
         model_output = self._execute(model_inputs)
+        # --- profile post ---
+        if _pi > 0 and self._prof_state == 1:
+            paddle.cuda.nvtx.range_pop()
+            if self._prof_cnt >= _pi:
+                from paddle.framework import core
+                core.nvprof_stop()
+                self._prof_state = 2
+                logger.info(f"[Profile] <<< STOP after {self._prof_cnt} steps")
+        # --- end profile post ---
         # save output (last batch)
         if self._cached_model_output_data is not None:
             # synchronizes the async DtoH copies of sampled_token_ids.
