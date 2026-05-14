@@ -14,8 +14,9 @@
 # limitations under the License.
 """
 
-from typing import Any, Dict, Optional
+from typing import Dict, Optional, Union
 
+from fastdeploy.utils import parse_quantization
 from fastdeploy.worker.worker_process import initialize_fd_config
 
 
@@ -54,7 +55,7 @@ class RolloutModelConfig:
         expert_parallel_size: int = 1,
         enable_expert_parallel: bool = False,
         ori_vocab_size: int = None,
-        quantization: Optional[Dict[str, Any]] = None,
+        quantization: Optional[Union[Dict, str]] = None,
         guided_decoding_backend: str = "off",
         disable_any_whitespace: bool = True,
         enable_logprob: bool = False,
@@ -68,6 +69,7 @@ class RolloutModelConfig:
         routing_replay_config: str = None,
         load_choices: str = "default_v1",
         lm_head_fp32: bool = False,
+        moe_gate_fp32: bool = True,
     ):
         # Required parameters
         self.model = model_name_or_path
@@ -107,7 +109,7 @@ class RolloutModelConfig:
         self.enable_expert_parallel = enable_expert_parallel
         self.data_parallel_size = data_parallel_size
         self.ori_vocab_size = ori_vocab_size
-        self.quantization = quantization
+        self.quantization = parse_quantization(quantization)
         self.guided_decoding_backend = guided_decoding_backend
         self.disable_any_whitespace = disable_any_whitespace
         self.enable_logprob = enable_logprob
@@ -121,6 +123,7 @@ class RolloutModelConfig:
         self.routing_replay_config = routing_replay_config
         self.load_choices = load_choices
         self.lm_head_fp32 = lm_head_fp32
+        self.moe_gate_fp32 = moe_gate_fp32
 
     def __str__(self):
         return "\n".join(f"{k}: {v}" for k, v in self.__dict__.items())

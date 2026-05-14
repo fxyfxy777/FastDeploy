@@ -24,12 +24,13 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import paddle
 
-if not hasattr(paddle, "compat"):
-    paddle.compat = SimpleNamespace(enable_torch_proxy=lambda scope: None)
+if not hasattr(paddle, "enable_compat"):
+    paddle.enable_compat = lambda scope=None: None
 
 from fastdeploy.config import CacheConfig, FDConfig, ParallelConfig, SchedulerConfig
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.request import (
+    BatchRequest,
     CompletionOutput,
     ImagePosition,
     Request,
@@ -81,6 +82,7 @@ def _build_manager(
     model_cfg.max_model_len = max_model_len
     model_cfg.architectures = architectures or ["test_model"]
     model_cfg.mm_max_tokens_per_item = None
+    model_cfg.version = None  # Required for register_info
     cache_cfg.bytes_per_token_per_layer = 1
     cache_cfg.kv_cache_ratio = 1.0
     parallel_cfg = ParallelConfig(args)
@@ -137,11 +139,11 @@ class TestResourceManagerV1(unittest.TestCase):
 
         cache_cfg = CacheConfig(args)
         model_cfg = SimpleNamespace(enable_mm=True)  # Enable multimodal for feature testing
-        speculative_cfg = SimpleNamespace(method=None)
         model_cfg.print = print
         model_cfg.max_model_len = 3200
         model_cfg.architectures = ["test_model"]
         model_cfg.mm_max_tokens_per_item = None
+        model_cfg.version = None  # Required for register_info
         cache_cfg.bytes_per_token_per_layer = 1
         cache_cfg.kv_cache_ratio = 1.0
         parallel_cfg = ParallelConfig(args)
@@ -153,7 +155,7 @@ class TestResourceManagerV1(unittest.TestCase):
             cache_config=cache_cfg,
             parallel_config=parallel_cfg,
             graph_opt_config=graph_opt_cfg,
-            speculative_config=speculative_cfg,
+            speculative_config=None,
             scheduler_config=scheduler_cfg,
         )
         self.manager = ResourceManagerV1(
@@ -304,6 +306,7 @@ class TestRevertChunkedMMInput(unittest.TestCase):
         model_cfg.max_model_len = 3200
         model_cfg.architectures = ["test_model"]
         model_cfg.mm_max_tokens_per_item = None
+        model_cfg.version = None  # Required for register_info
         cache_cfg.bytes_per_token_per_layer = 1
         cache_cfg.kv_cache_ratio = 1.0
         cache_cfg.block_size = 64
@@ -577,6 +580,7 @@ class TestResourceManagerV1Additional(unittest.TestCase):
         self.assertTrue(manager.has_resource_for_prefilled_req("prefilled"))
 
         request = _make_request(request_id="req-prefilled")
+        request.idx = 0
         request.metrics.decode_recv_req_time = 1.0
         request.metrics.decode_preallocate_req_time = 2.0
         manager.requests[request.request_id] = request
@@ -647,7 +651,7 @@ class TestResourceManagerV1Additional(unittest.TestCase):
 
         decode_request = _make_request(request_id="req-decode", prompt_token_ids=[1, 2])
         decode_request.idx = 0
-        decode_request.status = RequestStatus.RUNNING
+        decode_request.status = RequestStatus.RUNNING_DECODE
         decode_request.num_computed_tokens = 2
         decode_request.output_token_ids = [99]
         decode_request.block_tables = [1]
@@ -662,7 +666,7 @@ class TestResourceManagerV1Additional(unittest.TestCase):
         self.assertGreaterEqual(len(scheduled_reqs), 2)
         self.assertEqual(error_reqs, [])
         self.assertIn(decode_request.request_id, manager.using_extend_tables_req_id)
-        self.assertEqual(waiting_request.status, RequestStatus.RUNNING)
+        self.assertEqual(waiting_request.status, RequestStatus.RUNNING_PREFILL)
 
     def test_trigger_preempt_records_tasks(self):
         manager = _build_manager()
@@ -675,17 +679,18 @@ class TestResourceManagerV1Additional(unittest.TestCase):
         preempted_req = _make_request(request_id="req-preempted")
         preempted_req.idx = 0
         preempted_req.use_extend_tables = False
+        preempted_req.status = RequestStatus.RUNNING_DECODE
         request = _make_request(request_id="req-target")
         request.idx = 1
         manager.running = [request, preempted_req]
 
         preempted_reqs = []
-        scheduled_reqs = []
-        can_schedule = manager._trigger_preempt(request, 2, preempted_reqs, scheduled_reqs)
+        batch_request = BatchRequest()
+        can_schedule = manager._trigger_preempt(request, 2, preempted_reqs, batch_request)
         self.assertTrue(can_schedule)
         self.assertIn(preempted_req.request_id, manager.to_be_rescheduled_request_id_set)
         self.assertEqual(preempted_reqs[0], preempted_req)
-        self.assertEqual(scheduled_reqs[0].request_id, preempted_req.request_id)
+        self.assertEqual(batch_request.requests[0].request_id, preempted_req.request_id)
 
     def test_available_position_and_real_bsz(self):
         manager = _build_manager()

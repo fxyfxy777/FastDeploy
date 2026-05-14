@@ -23,6 +23,7 @@ XPU CI测试框架 - 通用配置和辅助函数
 4. 环境配置 - 设置XPU相关环境变量
 """
 
+import glob
 import json
 import os
 import shutil
@@ -30,6 +31,8 @@ import subprocess
 import time
 
 import pytest
+
+CASE_LOGS_DIR = os.path.join(os.getcwd(), "case_logs")
 
 
 def get_xpu_id():
@@ -97,6 +100,13 @@ def stop_processes():
 
     for cmd in commands:
         safe_kill_cmd(cmd)
+
+    try:
+        # 清理/dev/shm下的所有文件
+        subprocess.run("rm -rf /dev/shm/*", shell=True, check=True)
+    except subprocess.CalledProcessError:
+        print("Failed to remove files from /dev/shm")
+        pass
 
 
 def cleanup_resources():
@@ -203,9 +213,9 @@ def print_logs_on_failure():
         with open("server.log", "r") as f:
             print(f.read())
 
-    print("\n========== log/workerlog.0 ==========")
-    if os.path.exists("log/workerlog.0"):
-        with open("log/workerlog.0", "r") as f:
+    print("\n========== log/paddle/workerlog.0 ==========")
+    if os.path.exists("log/paddle/workerlog.0"):
+        with open("log/paddle/workerlog.0", "r") as f:
             print(f.read())
 
 
@@ -288,7 +298,6 @@ def setup_ep_env():
     """
     env_vars = {
         "BKCL_ENABLE_XDR": "1",
-        "BKCL_RDMA_NICS": "eth1,eth1,eth2,eth2",
         "BKCL_TRACE_TOPO": "1",
         "BKCL_PCIE_RING": "1",
         "XSHMEM_MODE": "1",
@@ -457,3 +466,42 @@ def setup_logprobs_zmq_env():
         os.environ[key] = value
         print(f"设置环境变量: {key}={value}")
     return original_values
+
+
+# ============ 日志归档 pytest hook ============
+
+
+def _archive_case_logs(test_name):
+    """
+    将当前工作目录下所有 log 开头的文件夹和 server.log 复制到 case_logs/{test_name}/ 下
+    """
+    dest_dir = os.path.join(CASE_LOGS_DIR, test_name)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # 复制所有 log* 目录
+    for entry in glob.glob("log*"):
+        if os.path.isdir(entry):
+            shutil.copytree(entry, os.path.join(dest_dir, entry), dirs_exist_ok=True)
+        elif os.path.isfile(entry):
+            # 处理 server.log 等 log 开头的文件
+            shutil.copy2(entry, os.path.join(dest_dir, entry))
+
+    # 单独处理 server.log（不以 log 开头但也是关键日志）
+    if os.path.exists("server.log") and not os.path.exists(os.path.join(dest_dir, "server.log")):
+        shutil.copy2("server.log", os.path.join(dest_dir, "server.log"))
+
+
+@pytest.hookimpl(hookwrapper=True, trylast=True)
+def pytest_runtest_makereport(item, call):
+    """每个测试阶段结束后归档日志（仅在 call 阶段后执行）"""
+    outcome = yield
+    report = outcome.get_result()
+
+    if report.when == "call":
+        # 使用测试文件名（不含 .py）作为归档目录名
+        test_file = os.path.basename(item.fspath)
+        test_name = os.path.splitext(test_file)[0]
+        try:
+            _archive_case_logs(test_name)
+        except Exception:
+            pass

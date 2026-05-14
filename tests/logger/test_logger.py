@@ -46,8 +46,12 @@ class LoggerTests(unittest.TestCase):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_unified_logger(self):
-        """Test _get_unified_logger through instance"""
-        test_cases = [(None, "fastdeploy"), ("module", "fastdeploy.module"), ("fastdeploy.utils", "fastdeploy.utils")]
+        """Test _get_unified_logger through instance (uses main channel)"""
+        test_cases = [
+            (None, "fastdeploy.main"),
+            ("module", "fastdeploy.main.module"),
+            ("fastdeploy.utils", "fastdeploy.utils"),  # 已有 fastdeploy. 前缀的保持不变
+        ]
 
         for name, expected in test_cases:
             with self.subTest(name=name):
@@ -161,9 +165,9 @@ class LoggerTests(unittest.TestCase):
                 # Create logger and get actual processed file name
                 logger = self.logger.get_trace_logger("test_file_name", input_name)
 
-                # Get file name from handler
+                # Get file name from handler (only check error-level handler)
                 for handler in logger.handlers:
-                    if isinstance(handler, LazyFileHandler):
+                    if isinstance(handler, LazyFileHandler) and handler.level == logging.ERROR:
                         actual_name = os.path.basename(handler.filename)
                         self.assertTrue(actual_name.endswith(expected_name))
 

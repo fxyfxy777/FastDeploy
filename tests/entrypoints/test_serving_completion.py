@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import numpy as np
 import paddle
 
-import fastdeploy.envs as envs
 import fastdeploy.metrics.trace as tracing
+from fastdeploy.entrypoints.openai.protocol import CompletionResponse
 from fastdeploy.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from fastdeploy.utils import ErrorCode, ParameterError
 from fastdeploy.worker.output import LogprobsLists, LogprobsTensors, SpeculateMetrics
@@ -124,40 +124,21 @@ class TestServingCompletion(unittest.IsolatedAsyncioTestCase):
         ec = _make_engine_client()
         ec.format_and_add_data = AsyncMock(side_effect=ParameterError("max_tokens", "bad"))
         serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            res = await _assert_error(self, serving, _make_request(prompt_token_ids=[1, 2]), param="max_tokens")
+        res = await _assert_error(self, serving, _make_request(prompt_token_ids=[1, 2]), param="max_tokens")
         ec.semaphore.release.assert_called_once()
-        ec = _make_engine_client()
-        ec.format_and_add_data = AsyncMock(side_effect=ValueError("bad"))
-        serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
-
-        def fake_from_generic_request(_, request_id):
-            return {"prompt": "hi", "request_id": request_id, "prompt_tokens": [1], "max_tokens": 2, "metrics": {}}
-
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", True):
-            with patch(
-                "fastdeploy.entrypoints.openai.serving_completion.Request.from_generic_request",
-                side_effect=fake_from_generic_request,
-            ):
-                await _assert_error(self, serving, _make_request(prompt="hi"), code=ErrorCode.INVALID_VALUE)
         ec = _make_engine_client()
         ec.format_and_add_data = AsyncMock(return_value=np.array([1, 2]))
         serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            with patch.object(serving, "completion_full_generator", AsyncMock(side_effect=RuntimeError("boom"))):
-                await _assert_error(
-                    self, serving, _make_request(prompt="hi"), contains="completion_full_generator error"
-                )
+        with patch.object(serving, "completion_full_generator", AsyncMock(side_effect=RuntimeError("boom"))):
+            await _assert_error(self, serving, _make_request(prompt="hi"), contains="completion_full_generator error")
         serving = OpenAIServingCompletion(_make_engine_client(), None, "pid", None, -1)
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            with patch.object(serving, "completion_stream_generator", return_value="streamed"):
-                res = await serving.create_completion(_make_request(request_id="req123", stream=True))
+        with patch.object(serving, "completion_stream_generator", return_value="streamed"):
+            res = await serving.create_completion(_make_request(request_id="req123", stream=True))
         self.assertEqual(res, "streamed")
         serving = OpenAIServingCompletion(_make_engine_client(), None, "pid", None, -1)
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            await _assert_error(
-                self, serving, _StreamRaiser(**_make_request().__dict__), contains="create_completion error"
-            )
+        await _assert_error(
+            self, serving, _StreamRaiser(**_make_request().__dict__), contains="create_completion error"
+        )
 
     async def test_completion_full_generator_branches(self):
         ec = _make_engine_client()
@@ -172,7 +153,7 @@ class TestServingCompletion(unittest.IsolatedAsyncioTestCase):
         rq = AsyncMock()
         spec = SpeculateMetrics(1, 0, 1.0, 1.0, [1], [1.0])
         # fmt: off
-        rq.get = AsyncMock(side_effect=timeouts + [[{"request_id": "req_0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1, "engine_recv_latest_token_time": 2, "speculate_metrics": spec}, "outputs": {"token_ids": [5], "text": "ok", "top_logprobs": [[[5]], [[-0.1]], [[1]]], "draft_top_logprobs": [[[5]], [[-0.2]], [[1]]], "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0}, "finished": True, "trace_carrier": "trace"}]])
+        rq.get = AsyncMock(side_effect=timeouts + [[{"request_id": "req::n::0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1, "engine_recv_latest_token_time": 2, "speculate_metrics": spec}, "outputs": {"token_ids": [5], "text": "ok", "top_logprobs": [[[5]], [[-0.1]], [[1]]], "draft_top_logprobs": [[[5]], [[-0.2]], [[1]]], "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0}, "finished": True, "trace_carrier": "trace"}]])
         # fmt: on
         ec.connection_manager.get_connection = AsyncMock(return_value=(Mock(), rq))
         serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
@@ -187,11 +168,12 @@ class TestServingCompletion(unittest.IsolatedAsyncioTestCase):
         ec.connection_manager.cleanup_request.assert_called_once_with("req")
         ec = _make_engine_client()
         rq = AsyncMock()
-        rq.get = AsyncMock(return_value=[{"request_id": "req_0", "error_code": 500, "error_msg": "bad"}])
+        rq.get = AsyncMock(return_value=[{"request_id": "req::n::0", "error_code": 500, "error_msg": "bad"}])
         ec.connection_manager.get_connection = AsyncMock(return_value=(Mock(), rq))
         serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
         res = await serving.completion_full_generator(_make_request(), 1, "req", 1, "m", [[1, 2]], [["p1", "p2"]], [2])
-        self.assertIsNone(res)
+        self.assertIsNotNone(res)
+        self.assertIsInstance(res, CompletionResponse)
         ec.connection_manager.cleanup_request.assert_called_once_with("req")
 
     def test_logprobs_helpers(self):
@@ -262,8 +244,8 @@ class TestServingCompletion(unittest.IsolatedAsyncioTestCase):
         # fmt: off
         # fmt: off
         rq.get = AsyncMock(return_value=[
-            {"request_id": "req_0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1}, "outputs": {"text": "hi", "token_ids": [10], "top_logprobs": [[[10]], [[-0.1]], [[1]]], "draft_top_logprobs": [[[10]], [[-0.2]], [[1]]], "send_idx": 0, "completion_tokens": 1, "num_cache_tokens": 1, "num_image_tokens": 2, "reasoning_token_num": 3, "tool_calls": [], "reasoning_content": "", "skipped": True}, "finished": False},
-            {"request_id": "req_0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1, "engine_recv_latest_token_time": 2}, "outputs": {"text": "ok", "token_ids": [11], "top_logprobs": None, "draft_top_logprobs": None, "send_idx": 1, "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0, "tool_calls": [{"id": "t"}], "reasoning_content": "", "skipped": False}, "finished": True, "trace_carrier": "trace"},
+            {"request_id": "req::n::0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1}, "outputs": {"text": "hi", "token_ids": [10], "top_logprobs": [[[10]], [[-0.1]], [[1]]], "draft_top_logprobs": [[[10]], [[-0.2]], [[1]]], "send_idx": 0, "completion_tokens": 1, "num_cache_tokens": 1, "num_image_tokens": 2, "reasoning_token_num": 3, "tool_calls": [], "reasoning_content": "", "skipped": True}, "finished": False},
+            {"request_id": "req::n::0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1, "engine_recv_latest_token_time": 2}, "outputs": {"text": "ok", "token_ids": [11], "top_logprobs": None, "draft_top_logprobs": None, "send_idx": 1, "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0, "tool_calls": [{"id": "t"}], "reasoning_content": "", "skipped": False}, "finished": True, "trace_carrier": "trace"},
         ])
         # fmt: on
         # fmt: on
@@ -289,10 +271,10 @@ class TestServingCompletion(unittest.IsolatedAsyncioTestCase):
                 ec.check_model_weight_status = Mock(return_value=True)
             elif kind == "timeout":
                 # fmt: off
-                rq.get = AsyncMock(side_effect=[asyncio.TimeoutError()] * 30 + [[{"request_id": "req_0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1}, "outputs": {"text": "ok", "token_ids": [1], "top_logprobs": None, "draft_top_logprobs": None, "send_idx": 1, "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0, "tool_calls": None, "reasoning_content": "", "skipped": False}, "finished": True}]])
+                rq.get = AsyncMock(side_effect=[asyncio.TimeoutError()] * 30 + [[{"request_id": "req::n::0", "error_code": 200, "metrics": {"arrival_time": 1, "inference_start_time": 1, "first_token_time": 1}, "outputs": {"text": "ok", "token_ids": [1], "top_logprobs": None, "draft_top_logprobs": None, "send_idx": 1, "completion_tokens": 1, "num_cache_tokens": 0, "num_image_tokens": 0, "reasoning_token_num": 0, "tool_calls": None, "reasoning_content": "", "skipped": False}, "finished": True}]])
                 # fmt: on
             else:
-                rq.get = AsyncMock(return_value=[{"request_id": "req_0", "error_code": 500, "error_msg": "bad"}])
+                rq.get = AsyncMock(return_value=[{"request_id": "req::n::0", "error_code": 500, "error_msg": "bad"}])
             ec.connection_manager.get_connection = AsyncMock(return_value=(Mock(), rq))
             serving = OpenAIServingCompletion(ec, None, "pid", None, -1)
             with patch.object(asyncio, "sleep", AsyncMock()):

@@ -109,7 +109,7 @@ class ExpertService:
         if envs.FD_ENABLE_RETURN_TEXT:
             self.engine.create_data_processor()
         if self.cfg.scheduler_config.name == "dp":
-            self.cfg.init_cache_info()
+            self.cfg.init_pd_info()
             self.engine.scheduler.start(local_data_parallel_id)
 
         if ipc_signal_suffix is not None:
@@ -122,7 +122,7 @@ class ExpertService:
         self.llm_logger.info(f"start expert service {local_data_parallel_id}")
 
         if self.cfg.scheduler_config.name == "splitwise":
-            self.cfg.init_cache_info()
+            self.cfg.init_pd_info()
             role = self.cfg.scheduler_config.splitwise_role
             host_ip = self.cfg.host_ip
             self.engine.scheduler.start(role, host_ip, self.cfg.register_info)
@@ -152,6 +152,7 @@ class ExpertService:
 
         if self.do_profile:
             get_profile_block_num = np.zeros([1], dtype=np.int32)
+            attempt = 0
             while True:
                 try:
                     self.get_profile_block_num_signal = IPCSignal(
@@ -162,11 +163,19 @@ class ExpertService:
                         create=False,
                     )
                     break
-                except:
+                except Exception as e:
+                    attempt += 1
+                    if attempt % 30 == 0:
+                        console_logger.warning(
+                            f"Waiting for IPC signal 'get_profile_block_num' to be created, "
+                            f"retried {attempt} times: {e}"
+                        )
                     time.sleep(1)
             self.reset_kvcache_blocks()
 
-        if self.cfg.scheduler_config.splitwise_role != "mixed" or self.cfg.cache_config.enable_prefix_caching:
+        if not envs.ENABLE_V1_KVCACHE_MANAGER and (
+            self.cfg.scheduler_config.splitwise_role != "mixed" or self.cfg.cache_config.enable_prefix_caching
+        ):
             self.cache_manager_processes = self.engine.start_cache_service(
                 self.cfg.local_device_ids,
                 self.cfg.parallel_config.local_engine_worker_queue_port,

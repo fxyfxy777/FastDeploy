@@ -38,7 +38,12 @@ from fastdeploy.entrypoints.openai.v1.serving_base import (
     ServeContext,
     ServingResponseContext,
 )
-from fastdeploy.utils import ErrorType, api_server_logger
+from fastdeploy.logger.request_logger import (
+    RequestLogLevel,
+    log_request,
+    log_request_error,
+)
+from fastdeploy.utils import ErrorType, make_choice_id
 from fastdeploy.worker.output import LogprobsLists
 
 
@@ -94,14 +99,14 @@ class OpenAIServingCompletion(OpenAiServingBase):
                     raise ValueError("Prompt type must be one of: str, list[str], list[int], list[list[int]]")
         except Exception as e:
             error_msg = f"OpenAIServingCompletion create_completion: {e}, {str(traceback.format_exc())}"
-            api_server_logger.error(error_msg)
+            log_request_error(message=error_msg)
             return ErrorResponse(error=ErrorInfo(message=error_msg, type=ErrorType.INTERNAL_ERROR))
 
         if request_prompt_ids is not None:
             request_prompts = request_prompt_ids
         ctx.preprocess_requests = []
         for idx, prompt in enumerate(request_prompts):
-            request_id_idx = f"{request_id}_{idx}"
+            request_id_idx = make_choice_id(request_id, idx)
             current_req_dict = request.to_dict_for_infer(request_id_idx, prompt)
             current_req_dict["arrival_time"] = time.time()
             ctx.preprocess_requests.append(current_req_dict)
@@ -199,7 +204,11 @@ class OpenAIServingCompletion(OpenAiServingBase):
             )
 
         except Exception as e:
-            api_server_logger.error(f"Error in _build_logprobs_response: {str(e)}, {str(traceback.format_exc())}")
+            log_request_error(
+                message="Error in _build_logprobs_response: {error}, {traceback}",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
             return None
 
     async def _build_stream_response(
@@ -271,9 +280,21 @@ class OpenAIServingCompletion(OpenAiServingBase):
                 choice.finish_reason = self._calc_finish_reason(
                     request_output, request.max_tokens, choice_completion_tokens
                 )
-                api_server_logger.info(f"Completion Streaming response last send: {chunk.model_dump_json()}")
+                log_request(
+                    level=RequestLogLevel.LIFECYCLE,
+                    message="Completion Streaming response last send: request_id={request_id}, finish_reason={finish_reason}, completion_tokens={completion_tokens}, logprobs={logprobs}",
+                    request_id=request_id,
+                    finish_reason=choice.finish_reason,
+                    completion_tokens=choice_completion_tokens,
+                    logprobs=choice.logprobs,
+                )
             if send_idx == 0 and not request.return_token_ids:
-                api_server_logger.info(f"Completion Streaming response send_idx 0: {chunk.model_dump_json()}")
+                log_request(
+                    level=RequestLogLevel.LIFECYCLE,
+                    message="Completion Streaming response send_idx 0: request_id={request_id}, completion_tokens={completion_tokens}",
+                    request_id=request_id,
+                    completion_tokens=response_ctx.choice_completion_tokens_dict[output.index],
+                )
             yield f"data: {chunk.model_dump_json()}\n\n"
             if request_output.finished and response_ctx.remain_choices == 0:
                 if include_usage:
@@ -287,7 +308,12 @@ class OpenAIServingCompletion(OpenAiServingBase):
                     yield f"data: {usage_chunk.model_dump_json(exclude_unset=True)}\n\n"
                 yield "data: [DONE]\n\n"
         except Exception as e:
-            api_server_logger.error(f"Error in completion_stream_generator: {e}, {str(traceback.format_exc())}")
+            log_request_error(
+                message="request[{request_id}] Error in completion_stream_generator: {error}, {traceback}",
+                request_id=request_id,
+                error=e,
+                traceback=traceback.format_exc(),
+            )
             yield f"data: {ErrorResponse(error=ErrorInfo(message=str(e), code='400', type=ErrorType.INTERNAL_ERROR)).model_dump_json(exclude_unset=True)}\n\n"
 
     async def _build_full_response(
@@ -302,9 +328,9 @@ class OpenAIServingCompletion(OpenAiServingBase):
         try:
             choices: List[CompletionResponseChoice] = []
 
-            for choice_index, respose_list in accumula_output_map.items():
+            for choice_index, response_list in accumula_output_map.items():
                 response: RequestOutput | None = None
-                for response_current in respose_list:
+                for response_current in response_list:
                     if response_current.error_code != 200:
                         raise ValueError("{}".format(response_current.error_msg))
                     if response is None:
@@ -321,10 +347,19 @@ class OpenAIServingCompletion(OpenAiServingBase):
                 choices=choices,
                 usage=response_ctx.usage,
             )
-            api_server_logger.info(f"Completion response: {res.model_dump_json()}")
+            log_request(
+                level=RequestLogLevel.FULL,
+                message="Completion response: {response}",
+                response=res.model_dump_json(),
+            )
             return res
         except Exception as e:
-            api_server_logger.error(f"Error in completion_full_generator: {e}", exc_info=True)
+            log_request_error(
+                message="request[{request_id}] Error in completion_full_generator: {error}, {traceback}",
+                request_id=ctx.request_id,
+                error=e,
+                traceback=traceback.format_exc(),
+            )
             return self._create_error_response(str(e))
 
     def build_completion_choice(

@@ -20,16 +20,19 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from fastdeploy.input.ernie4_5_vl_processor.image_preprocessor.image_preprocessor_adaptive import (
+from fastdeploy.input.image_processors.adaptive_processor import (
     AdaptiveImageProcessor,
+    make_batched_images,
+    make_batched_videos,
+)
+from fastdeploy.input.image_processors.common import (
     ceil_by_factor,
     floor_by_factor,
     is_scaled_image,
-    make_batched_images,
-    make_batched_videos,
     round_by_factor,
-    smart_resize,
+    smart_resize_paddleocr,
 )
+from fastdeploy.input.image_processors.common import smart_resize_qwen as smart_resize
 
 
 class TestImagePreprocessorAdaptive(unittest.TestCase):
@@ -338,9 +341,7 @@ class TestImagePreprocessorAdaptive(unittest.TestCase):
         # Create a scaled image (values between 0-1)
         img_array = np.random.rand(224, 224, 3).astype(np.float32) * 0.5
         # Use patch to capture warning
-        with patch(
-            "fastdeploy.input.ernie4_5_vl_processor.image_preprocessor.image_preprocessor_adaptive.data_processor_logger"
-        ) as mock_logger:
+        with patch("fastdeploy.input.image_processors.adaptive_processor.data_processor_logger") as mock_logger:
             # Directly call _preprocess, pass scaled image
             self.processor._preprocess(
                 [img_array],  # Pass scaled numpy array
@@ -354,9 +355,7 @@ class TestImagePreprocessorAdaptive(unittest.TestCase):
         """Test invalid image check in preprocess (line 464)"""
         # Test invalid image type - need to ensure valid_images returns False
         # Use patch to make valid_images return False, but make_batched_images succeeds
-        with patch(
-            "fastdeploy.input.ernie4_5_vl_processor.image_preprocessor.image_preprocessor_adaptive.valid_images"
-        ) as mock_valid:
+        with patch("fastdeploy.input.image_processors.adaptive_processor.valid_images") as mock_valid:
             mock_valid.return_value = False
             valid_images_list = [Image.new("RGB", (224, 224))]  # Valid image, but valid_images returns False
             with self.assertRaises(ValueError) as context:
@@ -493,6 +492,143 @@ class TestImagePreprocessorAdaptive(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             self.processor.preprocess(images=invalid_images)
         self.assertIn("Could not make batched images", str(context.exception))
+
+
+# =====================================================================
+# smart_resize_paddleocr
+# =====================================================================
+
+
+class TestSmartResizePaddleocr(unittest.TestCase):
+    """Tests for smart_resize_paddleocr in common.py."""
+
+    def test_normal_size(self):
+        """Normal image → output divisible by factor."""
+        h, w = smart_resize_paddleocr(224, 224, factor=28)
+        self.assertEqual(h % 28, 0)
+        self.assertEqual(w % 28, 0)
+
+    def test_small_image_scaled_up(self):
+        """Image smaller than factor → scaled up to at least factor."""
+        h, w = smart_resize_paddleocr(20, 20, factor=28)
+        self.assertGreaterEqual(h, 28)
+        self.assertGreaterEqual(w, 28)
+
+    def test_large_image_scaled_down(self):
+        """Large image → scaled down within max_pixels."""
+        h, w = smart_resize_paddleocr(2000, 2000, factor=28)
+        self.assertLessEqual(h * w, 28 * 28 * 1280)
+
+    def test_extreme_aspect_ratio_raises(self):
+        """Aspect ratio > 200 raises ValueError."""
+        with self.assertRaisesRegex(ValueError, "aspect ratio"):
+            smart_resize_paddleocr(6000, 28, factor=28)
+
+    def test_below_min_pixels_scaled_up(self):
+        """Image below min_pixels → scaled up."""
+        h, w = smart_resize_paddleocr(28, 28, factor=28, min_pixels=28 * 28 * 130)
+        self.assertGreaterEqual(h * w, 28 * 28 * 130)
+
+    def test_width_smaller_than_factor(self):
+        """Width < factor triggers scale-up via width."""
+        h, w = smart_resize_paddleocr(100, 10, factor=28)
+        self.assertGreaterEqual(w, 28)
+        self.assertEqual(h % 28, 0)
+        self.assertEqual(w % 28, 0)
+
+
+# =====================================================================
+# PaddleOCR ImageProcessor
+# =====================================================================
+
+
+class TestPaddleOCRImageProcessor(unittest.TestCase):
+    """Tests for PaddleOCR-specific ImageProcessor."""
+
+    def setUp(self):
+        from fastdeploy.input.image_processors.paddleocr_processor import ImageProcessor
+
+        self.ImageProcessor = ImageProcessor
+        self.default_params = {
+            "do_resize": True,
+            "resample": 3,
+            "do_rescale": True,
+            "rescale_factor": 1 / 255,
+            "do_normalize": True,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "do_convert_rgb": True,
+            "min_pixels": 28 * 28 * 130,
+            "max_pixels": 28 * 28 * 1280,
+            "patch_size": 14,
+            "temporal_patch_size": 1,
+            "merge_size": 2,
+        }
+        self.test_image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
+    def test_initialization(self):
+        """All init params stored correctly."""
+        processor = self.ImageProcessor(**self.default_params)
+        for param, value in self.default_params.items():
+            self.assertEqual(getattr(processor, param), value)
+
+    def test_smart_resize_called(self):
+        """Preprocess calls smart_resize_paddleocr (factor=patch_size*merge_size)."""
+        processor = self.ImageProcessor(**self.default_params)
+        result = processor.preprocess(self.test_image)
+        grid_thw = result["grid_thw"]
+        # grid_h and grid_w should be positive integers
+        self.assertEqual(len(grid_thw), 3)
+        self.assertGreater(grid_thw[1], 0)
+        self.assertGreater(grid_thw[2], 0)
+
+    def test_preprocess_single_image(self):
+        """Single image produces pixel_values and grid_thw."""
+        processor = self.ImageProcessor(**self.default_params)
+        result = processor.preprocess(self.test_image)
+        self.assertIn("pixel_values", result)
+        self.assertIn("grid_thw", result)
+        # [N, C, patch_size, patch_size]
+        self.assertEqual(result["pixel_values"].ndim, 4)
+
+    def test_preprocess_batch_images(self):
+        """Batch of images produces merged pixel_values."""
+        processor = self.ImageProcessor(**self.default_params)
+        batch = [self.test_image, self.test_image]
+        result = processor.preprocess(batch)
+        # Two images → double the patches
+        single_result = processor.preprocess(self.test_image)
+        self.assertEqual(
+            result["pixel_values"].shape[0],
+            single_result["pixel_values"].shape[0] * 2,
+        )
+
+    def test_preprocess_no_resize_no_normalize(self):
+        """Preprocess with do_resize=False and do_normalize=False."""
+        processor = self.ImageProcessor(**self.default_params)
+        result = processor.preprocess(self.test_image, do_resize=False, do_normalize=False)
+        self.assertIn("pixel_values", result)
+
+    def test_invalid_input_raises(self):
+        """Non-image input raises ValueError."""
+        processor = self.ImageProcessor(**self.default_params)
+        with self.assertRaises((ValueError, AttributeError)):
+            processor.preprocess("invalid_image")
+
+    def test_videos_not_implemented(self):
+        """Video input raises NotImplementedError."""
+        processor = self.ImageProcessor(**self.default_params)
+        with self.assertRaises(NotImplementedError):
+            processor.preprocess(self.test_image, videos=["video"])
+
+    def test_from_pretrained(self):
+        """from_pretrained loads JSON config."""
+        with patch(
+            "builtins.open",
+            unittest.mock.mock_open(read_data='{"do_resize": false}'),
+        ):
+            processor = self.ImageProcessor.from_pretrained("dummy_path")
+            self.assertFalse(processor.do_resize)
 
 
 if __name__ == "__main__":

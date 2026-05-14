@@ -26,7 +26,7 @@ import numpy as np
 
 import fastdeploy.envs as envs
 import fastdeploy.metrics.trace as tracing
-from fastdeploy.engine.request import Request, RequestOutput
+from fastdeploy.engine.request import RequestOutput
 from fastdeploy.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -44,6 +44,11 @@ from fastdeploy.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from fastdeploy.entrypoints.openai.response_processors import ChatResponseProcessor
+from fastdeploy.logger.request_logger import (
+    RequestLogLevel,
+    log_request,
+    log_request_error,
+)
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.trace.constants import LoggingEventName
 from fastdeploy.trace.trace_logger import print as trace_print
@@ -53,7 +58,9 @@ from fastdeploy.utils import (
     ParameterError,
     api_server_logger,
     clamp_prompt_logprobs,
+    get_choice_index,
     get_host_ip,
+    make_choice_id,
 )
 from fastdeploy.worker.output import (
     Logprob,
@@ -112,14 +119,16 @@ class OpenAIServingChat:
             err_msg = (
                 f"Only master node can accept completion request, please send request to master node: {self.master_ip}"
             )
-            api_server_logger.error(err_msg)
+            log_request_error(message="request[{request_id}] {error}", request_id=request.request_id, error=err_msg)
             return ErrorResponse(error=ErrorInfo(message=err_msg, type=ErrorType.INTERNAL_ERROR))
 
         if self.models:
             is_supported, request.model = self.models.is_supported_model(request.model)
             if not is_supported:
                 err_msg = f"Unsupported model: [{request.model}], support [{', '.join([x.name for x in self.models.model_paths])}] or default"
-                api_server_logger.error(err_msg)
+                log_request_error(
+                    message="request[{request_id}] {error}", request_id=request.request_id, error=err_msg
+                )
                 return ErrorResponse(
                     error=ErrorInfo(message=err_msg, type=ErrorType.INTERNAL_ERROR, code=ErrorCode.MODEL_NOT_SUPPORT)
                 )
@@ -129,7 +138,11 @@ class OpenAIServingChat:
                 await self.engine_client.semaphore.acquire()
             else:
                 await asyncio.wait_for(self.engine_client.semaphore.acquire(), timeout=self.max_waiting_time)
-            api_server_logger.info(f"current {self.engine_client.semaphore.status()}")
+            log_request(
+                RequestLogLevel.STAGES,
+                message="semaphore status: {status}",
+                status=self.engine_client.semaphore.status(),
+            )
 
             if request.request_id is not None:
                 request_id = request.request_id
@@ -141,14 +154,15 @@ class OpenAIServingChat:
                 request_id = f"chatcmpl-{uuid.uuid4()}"
             tracing.trace_req_start(rid=request_id, trace_content=request.trace_context, role="FastDeploy")
             del request.trace_context
-            api_server_logger.info(f"create chat completion request: {request_id}")
+            log_request(
+                level=RequestLogLevel.LIFECYCLE,
+                message="create chat completion request: {request_id}",
+                request_id=request_id,
+            )
             prompt_tokens = None
             max_tokens = None
             try:
-                if not envs.ENABLE_V1_DATA_PROCESSOR:
-                    current_req_dict = request.to_dict_for_infer(f"{request_id}_0")
-                else:
-                    current_req_dict = Request.from_generic_request(request, request_id=f"{request_id}_0")
+                current_req_dict = request.to_dict_for_infer(make_choice_id(request_id, 0))
                 if "chat_template" not in current_req_dict:
                     current_req_dict["chat_template"] = self.chat_template
                 current_req_dict["metrics"]["arrival_time"] = time.time()
@@ -159,14 +173,19 @@ class OpenAIServingChat:
                 if isinstance(prompt_token_ids, np.ndarray):
                     prompt_token_ids = prompt_token_ids.tolist()
             except ParameterError as e:
-                api_server_logger.error(f"request[{request_id}] generator error: {str(e)}, {e.message}")
+                log_request_error(
+                    message="request[{request_id}] generator error: {error}, {error_message}",
+                    request_id=request_id,
+                    error=str(e),
+                    error_message=e.message,
+                )
                 self.engine_client.semaphore.release()
                 return ErrorResponse(
                     error=ErrorInfo(message=str(e.message), type=ErrorType.INVALID_REQUEST_ERROR, param=e.param)
                 )
             except Exception as e:
                 error_msg = f"request[{request_id}] generator error: {str(e)}, {str(traceback.format_exc())}"
-                api_server_logger.error(error_msg)
+                log_request_error(message=error_msg)
                 self.engine_client.semaphore.release()
                 return ErrorResponse(error=ErrorInfo(message=error_msg, type=ErrorType.INVALID_REQUEST_ERROR))
 
@@ -181,12 +200,12 @@ class OpenAIServingChat:
                     )
                 except Exception as e:
                     error_msg = f"request[{request_id}]full generator error: {str(e)}, {str(traceback.format_exc())}"
-                    api_server_logger.error(error_msg)
+                    log_request_error(message=error_msg)
                     return ErrorResponse(error=ErrorInfo(message=error_msg, type=ErrorType.INTERNAL_ERROR))
         except asyncio.CancelledError as e:
-            await self.engine_client.abort(f"{request_id}_0", 1 if request.n is None else request.n)
-            error_msg = f"request[{request_id}_0] client disconnected: {str(e)}, {str(traceback.format_exc())}"
-            api_server_logger.error(error_msg)
+            await self.engine_client.abort(make_choice_id(request_id, 0), 1 if request.n is None else request.n)
+            error_msg = f"request[{make_choice_id(request_id, 0)}] client disconnected: {str(e)}, {str(traceback.format_exc())}"
+            log_request_error(message=error_msg)
             return ErrorResponse(
                 error=ErrorInfo(message=error_msg, type=ErrorType.INVALID_REQUEST_ERROR, code=ErrorCode.CLIENT_ABORTED)
             )
@@ -195,13 +214,13 @@ class OpenAIServingChat:
                 f"request[{request_id}] waiting error: {str(e)}, {str(traceback.format_exc())}, "
                 f"max waiting time: {self.max_waiting_time}"
             )
-            api_server_logger.error(error_msg)
+            log_request_error(message=error_msg)
             return ErrorResponse(
                 error=ErrorInfo(message=error_msg, type=ErrorType.TIMEOUT_ERROR, code=ErrorCode.TIMEOUT)
             )
 
     def _create_streaming_error_response(self, message: str) -> str:
-        api_server_logger.error(message)
+        log_request_error(message=message)
         error_response = ErrorResponse(error=ErrorInfo(message=message, type=ErrorType.INTERNAL_ERROR))
         return error_response.model_dump_json()
 
@@ -252,15 +271,15 @@ class OpenAIServingChat:
             choices=[],
             model=model_name,
         )
-        api_server_logger.info(f"create chat completion request: {request_id}")
 
         try:
             dealer, response_queue = await self.engine_client.connection_manager.get_connection(
                 request_id, num_choices
             )
-            request_ids = [f"{request_id}_{i}" for i in range(num_choices)]
-            for rid in request_ids:
-                dealer.write([b"", rid.encode("utf-8")])
+            if not envs.ZMQ_SEND_BATCH_DATA:
+                request_ids = [make_choice_id(request_id, i) for i in range(num_choices)]
+                for rid in request_ids:
+                    dealer.write([b"", rid.encode("utf-8")])
             choices = []
             current_waiting_time = 0
             response_processor = ChatResponseProcessor(
@@ -274,6 +293,9 @@ class OpenAIServingChat:
                 try:
                     response = await asyncio.wait_for(response_queue.get(), timeout=10)
                     current_waiting_time = 0
+                except asyncio.CancelledError:
+                    # Client disconnected, propagate to outer handler
+                    raise
                 except asyncio.TimeoutError:
                     current_waiting_time += 10
                     if current_waiting_time == 300:
@@ -294,10 +316,11 @@ class OpenAIServingChat:
                     response,
                     stream=True,
                     include_stop_str_in_output=include_stop_str_in_output,
+                    request=request,
                 )
 
                 async for res in generator:
-                    idx = int(res["request_id"].split("_")[-1])
+                    idx = get_choice_index(res["request_id"])
                     if res.get("error_code", 200) != 200:
                         raise ValueError("{}".format(res["error_msg"]))
 
@@ -370,7 +393,12 @@ class OpenAIServingChat:
                                     completion_tokens_details=CompletionTokenUsageInfo(reasoning_tokens=0),
                                 )
                             yield f"data: {chunk.model_dump_json(exclude_unset=True)} \n\n"
-                            api_server_logger.info(f"Chat Streaming response send_idx 0: {chunk.model_dump_json()}")
+                            log_request(
+                                level=RequestLogLevel.LIFECYCLE,
+                                message="Chat Streaming response send_idx 0: request_id={request_id}, completion_tokens={completion_tokens}",
+                                request_id=request_id,
+                                completion_tokens=0,
+                            )
                         first_iteration = False
 
                     output = res["outputs"]
@@ -404,26 +432,29 @@ class OpenAIServingChat:
 
                     output_speculate_metrics = res["metrics"].get("speculate_metrics", None)
 
-                    delta_message = DeltaMessage(
-                        reasoning_content=output["reasoning_content"],
-                        prompt_token_ids=None,
-                        tool_calls=output["tool_calls"],
-                        completion_token_ids=None,
-                    )
-
                     if output["tool_calls"] is not None:
                         tool_called[idx] = True
 
+                    if output["skipped"] and not request.return_token_ids:
+                        continue
+
+                    delta_message = DeltaMessage(
+                        reasoning_content=output["reasoning_content"],
+                        tool_calls=output["tool_calls"],
+                        prompt_token_ids=None,
+                        completion_token_ids=None,
+                        completion_tokens=None,
+                    )
+
                     if response_processor.enable_multimodal_content():
-                        delta_message.multimodal_content = output["multipart"]
+                        delta_message.multimodal_content = (
+                            [{"type": "text", "text": ""}] if output["skipped"] else output["multipart"]
+                        )
                     else:
-                        delta_message.content = output["text"]
+                        delta_message.content = "" if output["skipped"] else (output["text"] or "")
 
                     if output.get("audio_content", None) is not None:
                         delta_message.audio_content = output["audio_content"]
-
-                    if output["skipped"]:
-                        continue
 
                     choice = ChatCompletionResponseStreamChoice(
                         index=idx,
@@ -461,6 +492,9 @@ class OpenAIServingChat:
                         if res.get("error_msg") is not None and "Recover" in res["error_msg"]:
                             choice.finish_reason = "recover_stop"
 
+                        if res.get("error_msg") is not None and "Aborted" in res["error_msg"]:
+                            choice.finish_reason = "abort"
+
                         inference_start_time[idx] = 0
 
                     if request.collect_metrics:
@@ -489,7 +523,14 @@ class OpenAIServingChat:
                         chunk.choices = choices
                         yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
                         if res["finished"]:
-                            api_server_logger.info(f"Chat Streaming response last send: {chunk.model_dump_json()}")
+                            log_request(
+                                level=RequestLogLevel.LIFECYCLE,
+                                message="Chat Streaming response last send: request_id={request_id}, finish_reason={finish_reason}, completion_tokens={completion_tokens}, logprobs={logprobs}",
+                                request_id=request_id,
+                                finish_reason=choice.finish_reason,
+                                completion_tokens=previous_num_tokens[idx],
+                                logprobs=logprobs_res,
+                            )
                         choices = []
 
             if include_usage:
@@ -515,9 +556,9 @@ class OpenAIServingChat:
                 yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
         except asyncio.CancelledError as e:
-            await self.engine_client.abort(f"{request_id}_0", 1 if request.n is None else request.n)
-            error_msg = f"request[{request_id}_0] client disconnected: {str(e)}, {str(traceback.format_exc())}"
-            api_server_logger.error(error_msg)
+            await self.engine_client.abort(make_choice_id(request_id, 0), 1 if request.n is None else request.n)
+            error_msg = f"request[{make_choice_id(request_id, 0)}] client disconnected: {str(e)}, {str(traceback.format_exc())}"
+            log_request_error(message=error_msg)
         except Exception as e:
             error_data = self._create_streaming_error_response(
                 f"request[{request_id}] generate stream error: {str(e)}, {str(traceback.format_exc())}"
@@ -528,7 +569,12 @@ class OpenAIServingChat:
             tracing.trace_req_finish(request_id)
             await self.engine_client.connection_manager.cleanup_request(request_id)
             self.engine_client.semaphore.release()
-            api_server_logger.info(f"release {request_id} {self.engine_client.semaphore.status()}")
+            log_request(
+                level=RequestLogLevel.STAGES,
+                message="release {request_id} {status}",
+                request_id=request_id,
+                status=self.engine_client.semaphore.status(),
+            )
             yield "data: [DONE]\n\n"
 
     async def chat_completion_full_generator(
@@ -551,10 +597,10 @@ class OpenAIServingChat:
             dealer, response_queue = await self.engine_client.connection_manager.get_connection(
                 request_id, num_choices
             )
-            # dealer.write([b"", request_id.encode("utf-8")])
-            request_ids = [f"{request_id}_{i}" for i in range(num_choices)]
-            for rid in request_ids:
-                dealer.write([b"", rid.encode("utf-8")])
+            if not envs.ZMQ_SEND_BATCH_DATA:
+                request_ids = [make_choice_id(request_id, i) for i in range(num_choices)]
+                for rid in request_ids:
+                    dealer.write([b"", rid.encode("utf-8")])
             previous_num_tokens = [0] * num_choices
             reasoning_num_tokens = [0] * num_choices
             current_waiting_time = 0
@@ -603,12 +649,25 @@ class OpenAIServingChat:
                     response,
                     stream=False,
                     include_stop_str_in_output=include_stop_str_in_output,
+                    request=request,
                 )
                 async for data in generator:
+                    idx = get_choice_index(data["request_id"])
                     if data.get("error_code", 200) != 200:
-                        raise ValueError("{}".format(data["error_msg"]))
-                    idx = int(data["request_id"].split("_")[-1])
-                    # api_server_logger.debug(f"Client {request_id} received: {data}")
+                        # Error response - include already-generated tokens in the response
+                        data["outputs"] = {
+                            "text": "",
+                            "completion_tokens": "",
+                            "reasoning_content": "",
+                            "tool_calls": None,
+                            "reasoning_token_num": 0,
+                            "num_image_tokens": 0,
+                            "token_ids": [],
+                            "top_logprobs": None,
+                            "draft_top_logprobs": None,
+                        }
+                        data["metrics"] = data.get("metrics") or {}
+                        data["finished"] = True
                     previous_num_tokens[idx] += len(data["outputs"]["token_ids"])
                     completion_token_ids[idx].extend(data["outputs"]["token_ids"])
                     # The logprob for handling the response
@@ -695,7 +754,9 @@ class OpenAIServingChat:
             tracing.trace_req_finish(request_id)
             await self.engine_client.connection_manager.cleanup_request(request_id)
             self.engine_client.semaphore.release()
-            api_server_logger.info(f"release {self.engine_client.semaphore.status()}")
+            log_request(
+                RequestLogLevel.STAGES, message="release {status}", status=self.engine_client.semaphore.status()
+            )
 
         num_prompt_tokens = len(prompt_token_ids)
         num_generated_tokens = sum(previous_num_tokens)
@@ -722,7 +783,7 @@ class OpenAIServingChat:
             choices=choices,
             usage=usage,
         )
-        api_server_logger.info(f"Chat response: {res.model_dump_json()}")
+        log_request(RequestLogLevel.CONTENT, message="Chat response: {response}", response=res.model_dump_json())
         return res
 
     async def _create_chat_completion_choice(
@@ -744,8 +805,28 @@ class OpenAIServingChat:
         max_tokens: int,
         speculate_metrics: SpeculateMetrics | None,
     ) -> ChatCompletionResponseChoice:
-        idx = int(data["request_id"].split("_")[-1])
+        idx = get_choice_index(data["request_id"])
         output = data["outputs"]
+
+        finish_reason = "stop"
+        if previous_num_tokens != max_tokens:
+            finish_reason = "stop"
+            if output.get("tool_calls"):
+                finish_reason = "tool_calls"
+        else:
+            finish_reason = "length"
+        if data.get("error_msg", None) is not None and "Recover" in data["error_msg"]:
+            finish_reason = "recover_stop"
+
+        if data.get("error_msg", None) is not None and "Aborted" in data["error_msg"]:
+            finish_reason = "abort"
+
+        if data.get("error_msg", None) is not None and "PD Error" in data["error_msg"]:
+            finish_reason = "pd_reschedule"
+
+        return_completion_token_ids = False
+        if request.return_token_ids or finish_reason == "pd_reschedule":
+            return_completion_token_ids = True
 
         if output is not None and output.get("metrics") and output["metrics"].get("request_start_time"):
             main_process_metrics.e2e_request_latency.observe(
@@ -756,7 +837,7 @@ class OpenAIServingChat:
             reasoning_content=output.get("reasoning_content"),
             tool_calls=output.get("tool_calls"),
             prompt_token_ids=prompt_token_ids if request.return_token_ids else None,
-            completion_token_ids=completion_token_ids if request.return_token_ids else None,
+            completion_token_ids=completion_token_ids if return_completion_token_ids else None,
             prompt_tokens=prompt_tokens if request.return_token_ids else None,
             completion_tokens=output.get("completion_tokens") if request.return_token_ids else None,
         )
@@ -782,16 +863,6 @@ class OpenAIServingChat:
         num_input_image_tokens[idx] = data.get("num_input_image_tokens", 0)
         num_input_video_tokens[idx] = data.get("num_input_video_tokens", 0)
         num_image_tokens[idx] = output.get("num_image_tokens", 0) or 0
-
-        finish_reason = "stop"
-        if previous_num_tokens != max_tokens:
-            finish_reason = "stop"
-            if output.get("tool_calls"):
-                finish_reason = "tool_calls"
-        else:
-            finish_reason = "length"
-        if data.get("error_msg", None) is not None and "Recover" in data["error_msg"]:
-            finish_reason = "recover_stop"
 
         return ChatCompletionResponseChoice(
             index=idx,
@@ -893,7 +964,7 @@ class OpenAIServingChat:
 
         except Exception as e:
             error_msg = f"Error in _build_logprobs_response: {e}, {str(traceback.format_exc())}"
-            api_server_logger.error(error_msg)
+            log_request_error(message=error_msg)
             return None
 
     def _build_prompt_logprobs(
@@ -910,23 +981,30 @@ class OpenAIServingChat:
 
         token_ids, logprobs, ranks = prompt_logprobs_tensors
 
+        # Normalize to plain Python lists (support both Tensor and list inputs)
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+            logprobs = logprobs.tolist()
+            ranks = ranks.tolist()
+
         # Detokenize non-incrementally.
         # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]
         if include_logprobs_decode_token:
             decoded_tokens = [
                 self.engine_client.data_processor.process_logprob_response(token_id)
-                for token_id in token_ids.flatten().tolist()
+                for row in token_ids
+                for token_id in row
             ]
         else:
             decoded_tokens = None
 
         # Recover shapes.
-        num_prompt_tokens, num_logprobs = logprobs.shape
+        num_prompt_tokens = len(logprobs)
+        num_logprobs = len(logprobs[0]) if num_prompt_tokens > 0 else 0
 
-        # Pythonize the paddle tensors.
-        prompt_token_ranks = ranks.tolist()
-        prompt_logprobs = logprobs.tolist()
-        token_ids = token_ids.tolist()
+        # Build result.
+        prompt_token_ranks = ranks
+        prompt_logprobs = logprobs
         result: Optional[PromptLogprobs] = [None]
         # Make Logprob for each position.
         for pos in range(num_prompt_tokens):

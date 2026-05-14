@@ -21,9 +21,12 @@ import time
 import traceback
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
-from typing import Any, Dict, Generic, Optional
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional
 from typing import TypeVar as TypingTypeVar
 from typing import Union
+
+if TYPE_CHECKING:
+    from fastdeploy.cache_manager.v1.metadata import MatchResult
 
 import numpy as np
 from fastapi.responses import JSONResponse
@@ -31,6 +34,7 @@ from pydantic import BaseModel
 from typing_extensions import TypeVar
 
 from fastdeploy import envs
+from fastdeploy.cache_manager.v1.metadata import CacheLevel, CacheSwapMetadata
 from fastdeploy.engine.pooling_params import PoolingParams
 from fastdeploy.engine.sampling_params import SamplingParams
 from fastdeploy.entrypoints.openai.protocol import (
@@ -39,7 +43,11 @@ from fastdeploy.entrypoints.openai.protocol import (
     StructuralTagResponseFormat,
     ToolCall,
 )
-from fastdeploy.utils import data_processor_logger
+from fastdeploy.logger.request_logger import (
+    RequestLogLevel,
+    log_request,
+    log_request_error,
+)
 from fastdeploy.worker.output import (
     LogprobsLists,
     PromptLogprobs,
@@ -50,10 +58,11 @@ from fastdeploy.worker.output import (
 
 class RequestStatus(Enum):
     WAITING = 0
-    RUNNING = 1
-    PREEMPTED = 2
-    FINISHED = 3
-    ABORT = 4
+    RUNNING_PREFILL = 1
+    RUNNING_DECODE = 2
+    PREEMPTED = 3
+    FINISHED = 4
+    ABORT = 5
 
 
 class RequestType(Enum):
@@ -61,6 +70,7 @@ class RequestType(Enum):
     DECODE = 1
     PREEMPTED = 2
     EXTEND = 3
+    ABORT = 4
 
 
 @dataclass
@@ -128,6 +138,9 @@ class Request:
         top_logprobs: Optional[int] = None,
         # from PoolingRequest
         add_special_tokens: Optional[bool] = False,
+        zmq_worker_pid: Optional[int] = None,
+        # block hasher for dynamic hash computation
+        block_hasher: Optional[callable] = None,
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
@@ -141,10 +154,17 @@ class Request:
         self.tools = tools
         # model specific token ids: end of sentence token ids
         self.eos_token_ids = eos_token_ids
-        self.num_cached_tokens = 0
-        self.num_cached_blocks = 0
         self.disable_chat_template = disable_chat_template
         self.disaggregate_info = disaggregate_info
+
+        # prefix caching related
+        self.num_cached_tokens = 0
+        self.num_cached_blocks = 0
+        self._prompt_hashes: list[str] = []
+        self._block_hasher = block_hasher
+        self._match_result: Optional[MatchResult] = None
+        self.cache_swap_metadata: list[CacheSwapMetadata] = []
+        self.cache_evict_metadata: list[CacheSwapMetadata] = []
 
         # speculative method in disaggregate-mode
         self.draft_token_ids = draft_token_ids
@@ -203,6 +223,7 @@ class Request:
             self.metrics = RequestMetrics()
         else:
             self.metrics = metrics
+        self.metrics.prompt_token_ids_len = self.prompt_token_ids_len
         # from ChatCompletionRequest or CompletionRequest
         self.user = user
         self.metadata = metadata
@@ -216,6 +237,39 @@ class Request:
         self.top_logprobs = top_logprobs
         # from PoolingRequest
         self.add_special_tokens = add_special_tokens
+        self.zmq_worker_pid = zmq_worker_pid
+
+    @property
+    def prompt_hashes(self) -> list[str]:
+        """
+        Dynamically get prompt_hashes, automatically computing new block hashes.
+
+        When accessing this property, it checks if there are new complete blocks
+        that need hash computation, and if so, computes and appends them.
+        """
+        if self._block_hasher is not None:
+            new_hashes = self._block_hasher(self)
+            if new_hashes:
+                self._prompt_hashes.extend(new_hashes)
+        return self._prompt_hashes
+
+    @property
+    def match_result(self) -> Optional[MatchResult]:
+        return self._match_result
+
+    def set_block_hasher(self, block_hasher: callable):
+        """Set the block hasher for dynamic hash computation."""
+        self._block_hasher = block_hasher
+
+    def pop_cache_swap_metadata(self) -> list[CacheSwapMetadata]:
+        result = self.cache_swap_metadata
+        self.cache_swap_metadata = []
+        return result
+
+    def pop_cache_evict_metadata(self) -> list[CacheSwapMetadata]:
+        result = self.cache_evict_metadata
+        self.cache_evict_metadata = []
+        return result
 
     @classmethod
     def _process_guided_json(cls, r: T):
@@ -310,15 +364,13 @@ class Request:
             ), "The parameter `raw_request` is not supported now, please use completion api instead."
             for key, value in req.metadata.items():
                 setattr(request, key, value)
-            from fastdeploy.utils import api_server_logger
-
-            api_server_logger.warning("The parameter metadata is obsolete.")
+            log_request(RequestLogLevel.STAGES, message="The parameter metadata is obsolete.")
 
         return request
 
     @classmethod
     def from_dict(cls, d: dict):
-        data_processor_logger.debug(f"{d}")
+        log_request(RequestLogLevel.FULL, message="{request}", request=d)
         sampling_params: SamplingParams = None
         pooling_params: PoolingParams = None
         metrics: RequestMetrics = None
@@ -349,8 +401,11 @@ class Request:
                         ImagePosition(**mm_pos) if not isinstance(mm_pos, ImagePosition) else mm_pos
                     )
             except Exception as e:
-                data_processor_logger.error(
-                    f"Convert mm_positions to ImagePosition error: {e}, {str(traceback.format_exc())}"
+                log_request_error(
+                    message="request[{request_id}] Convert mm_positions to ImagePosition error: {error}, {traceback}",
+                    request_id=d.get("request_id"),
+                    error=str(e),
+                    traceback=traceback.format_exc(),
                 )
         return cls(
             request_id=d["request_id"],
@@ -405,16 +460,29 @@ class Request:
         Custom getstate method for pickle support.
         Handles unpicklable attributes by filtering them from __dict__.
         """
-        # Create a filtered dictionary without problematic attributes
+        # Attributes that cannot or need not be pickled for cross-process transfer.
+        # _block_hasher: closure/callable, not picklable.
+        # _match_result: contains BlockNode tree with parent<->children circular
+        #   references, which causes RecursionError during pickling.
+        # async_process_futures: asyncio futures, not picklable.
+        _SKIP_KEYS = {"_block_hasher", "_match_result"}
         filtered_dict = {}
         for key, value in self.__dict__.items():
-            # Skip attributes that are known to contain unpicklable objects
-            if key == "async_process_futures":
+            if key in _SKIP_KEYS:
+                continue
+            elif key == "async_process_futures":
                 filtered_dict[key] = []
             else:
                 filtered_dict[key] = value
-
         return filtered_dict
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Restore fields that were excluded from pickling with safe defaults.
+        if "_block_hasher" not in self.__dict__:
+            self._block_hasher = None
+        if "_match_result" not in self.__dict__:
+            self._match_result = None
 
     def __eq__(self, other):
         """
@@ -457,13 +525,12 @@ class Request:
             "ic_req_data": self.ic_req_data,
         }
 
-        # During multimodal PD separation, position_ids are required
         if isinstance(self.multimodal_inputs, dict):
             # Optimize multimodal data transfer during PD separation:
-            # - V1 mode (ENABLE_V1_KVCACHE_SCHEDULER=1): Only position_ids needed for decode nodes
+            # - V1 mode (ENABLE_V1_KVCACHE_SCHEDULER=1): position_ids, mm_positions and mm_hashes needed for decode nodes
             # - V0 mode (ENABLE_V1_KVCACHE_SCHEDULER=0): Full field set required for compatibility
             # This filtering significantly reduces serialized data size for large numpy arrays
-            allowed_keys = {"position_ids"}
+            allowed_keys = {"position_ids", "mm_positions", "mm_hashes"}
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 allowed_keys.update(["input_ids", "token_type_ids", "images", "image_type_ids", "grid_thw"])
 
@@ -544,6 +611,127 @@ class Request:
         if hasattr(self.sampling_params, key):
             return True
         return hasattr(self, key)
+
+
+class BatchRequest:
+    def __init__(self):
+        self.requests: list[Request] = []
+
+        self.cache_swap_metadata: Optional[CacheSwapMetadata] = None
+        self.cache_evict_metadata: Optional[CacheSwapMetadata] = None
+
+    def add_request(self, request):
+        if hasattr(request, "cache_swap_metadata") and request.cache_swap_metadata:
+            self.append_swap_metadata(request.pop_cache_swap_metadata())
+            request.cache_swap_metadata = []
+        if hasattr(request, "cache_evict_metadata") and request.cache_evict_metadata:
+            self.append_evict_metadata(request.pop_cache_evict_metadata())
+            request.cache_evict_metadata = []
+
+        self.requests.append(request)
+
+    def append_swap_metadata(self, metadata: List[CacheSwapMetadata]):
+        for meta in metadata:
+            if self.cache_swap_metadata:
+                self.cache_swap_metadata.src_block_ids.extend(meta.src_block_ids)
+                self.cache_swap_metadata.dst_block_ids.extend(meta.dst_block_ids)
+                self.cache_swap_metadata.hash_values.extend(meta.hash_values)
+            else:
+                self.cache_swap_metadata = CacheSwapMetadata(
+                    src_block_ids=meta.src_block_ids,
+                    dst_block_ids=meta.dst_block_ids,
+                    src_type=CacheLevel.HOST,
+                    dst_type=CacheLevel.DEVICE,
+                    hash_values=meta.hash_values,
+                )
+
+    def append_evict_metadata(self, metadata: List[CacheSwapMetadata]):
+        for meta in metadata:
+            if self.cache_evict_metadata:
+                self.cache_evict_metadata.src_block_ids.extend(meta.src_block_ids)
+                self.cache_evict_metadata.dst_block_ids.extend(meta.dst_block_ids)
+                self.cache_evict_metadata.hash_values.extend(meta.hash_values)
+            else:
+                self.cache_evict_metadata = CacheSwapMetadata(
+                    src_block_ids=meta.src_block_ids,
+                    dst_block_ids=meta.dst_block_ids,
+                    src_type=CacheLevel.DEVICE,
+                    dst_type=CacheLevel.HOST,
+                    hash_values=meta.hash_values,
+                )
+
+    def __repr__(self):
+        requests_repr = repr(self.requests)
+        return f"BatchRequest(requests={requests_repr}, swap_metadata={self.cache_swap_metadata}, evict_metadata={self.cache_evict_metadata})"
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["requests"] = [req.__getstate__() if hasattr(req, "__getstate__") else req for req in state["requests"]]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        restored_requests = []
+        for req_data in self.requests:
+            if isinstance(req_data, dict):
+                req = Request.__new__(Request)
+                req.__dict__.update(req_data)
+                restored_requests.append(req)
+            else:
+                restored_requests.append(req_data)
+        self.requests = restored_requests
+
+    def __iter__(self):
+        for req in self.requests:
+            yield req
+
+    def __getitem__(self, index):
+        return self.requests[index]
+
+    def __len__(self):
+        return len(self.requests)
+
+    def append(self, batch_request: "BatchRequest"):
+        self.requests.extend(batch_request.requests)
+        if batch_request.cache_swap_metadata:
+            self.append_swap_metadata([batch_request.cache_swap_metadata])
+        if batch_request.cache_evict_metadata:
+            self.append_evict_metadata([batch_request.cache_evict_metadata])
+
+    def extend(self, batch_requests: list["BatchRequest"]):
+        for br in batch_requests:
+            self.append(br)
+
+    @classmethod
+    def from_tasks(cls, tasks: list) -> tuple["BatchRequest", list, int]:
+        """Classify tasks from the engine worker queue into inference requests and control requests.
+
+        Args:
+            tasks: List of (payload, real_bsz) tuples from task_queue.get_tasks().
+                   payload is one of: BatchRequest, List[Request], or [ControlRequest].
+
+        Returns:
+            (batch_request, control_reqs, max_occupied_batch_index)
+              - batch_request: merged BatchRequest containing all inference requests
+              - control_reqs: list of ControlRequest objects
+              - max_occupied_batch_index: real_bsz of the last inference task batch
+        """
+        batch_request = cls()
+        control_reqs = []
+        max_occupied_batch_index = 0
+
+        for payload, bsz in tasks:
+            if len(payload) > 0 and isinstance(payload[0], ControlRequest):
+                control_reqs.append(payload[0])
+            else:
+                max_occupied_batch_index = int(bsz)
+                if isinstance(payload, cls):
+                    batch_request.append(payload)
+                else:
+                    for req in payload:
+                        batch_request.add_request(req)
+
+        return batch_request, control_reqs, max_occupied_batch_index
 
 
 class ControlRequest:
@@ -725,7 +913,6 @@ class CompletionOutput:
     delta_message: Optional[DeltaMessage] = None
     multipart: Optional[list[Any]] = None
     num_image_tokens: Optional[int] = None
-    enable_parser: bool = False
 
     def to_dict(self):
         """
@@ -864,12 +1051,14 @@ class RequestMetrics:
 
     llm_engine_recv_req_timestamp: Optional[float] = None
     llm_engine_send_req_to_engine_timestamp: Optional[float] = None
+    llm_engine_send_req_to_decoder_engine_timestamp: Optional[float] = None
     llm_engine_recv_latest_token_timestamp: Optional[float] = None
     llm_engine_recv_token_timestamp: Optional[float] = None
 
     speculate_metrics: Optional[SpeculateMetrics] = None
 
     # cache related
+    prompt_token_ids_len: Optional[int] = None
     gpu_cache_token_num: Optional[int] = 0
     cpu_cache_token_num: Optional[int] = 0
     storage_cache_token_num: Optional[int] = 0
@@ -950,6 +1139,10 @@ class RequestMetrics:
 
     def __setitem__(self, key, value):
         setattr(self, key, value)
+
+    # Set engine time for decoder-node
+    def update_decoder_start_time(self):
+        self.llm_engine_send_req_to_decoder_engine_timestamp = self.decode_inference_start_time
 
 
 class RequestOutput:

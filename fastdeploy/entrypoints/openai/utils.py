@@ -17,18 +17,26 @@
 import asyncio
 import functools
 import heapq
+import os
 import random
 import time
+import traceback
 from multiprocessing.reduction import ForkingPickler
 
 import aiozmq
+import msgpack
 import zmq
 from fastapi import Request
 
+import fastdeploy.envs as envs
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.metrics.stats import ZMQMetricsStats
-from fastdeploy.utils import FlexibleArgumentParser, api_server_logger
+from fastdeploy.utils import (
+    FlexibleArgumentParser,
+    api_server_logger,
+    get_base_request_id,
+)
 
 UVICORN_CONFIG = {
     "version": 1,
@@ -77,27 +85,59 @@ UVICORN_CONFIG = {
 
 class DealerConnectionManager:
     """
-    Manager for dealer connections, supporting multiplexing and connection reuse
+    Manager for dealer connections, supporting multiplexing and connection reuse.
+    When ZMQ_SEND_BATCH_DATA=1: uses PULL client for batch response reception.
+    When ZMQ_SEND_BATCH_DATA=0: uses DEALER connections with ROUTER for per-query response.
     """
 
     def __init__(self, pid, max_connections=10):
         self.pid = pid
-        self.max_connections = max(max_connections, 10)
-        self.connections = []
-        self.connection_load = []
-        self.connection_heap = []
         self.request_map = {}  # request_id -> response_queue
-        self.request_num = {}  # request_id -> num_choices
         self.lock = asyncio.Lock()
-        self.connection_tasks = []
         self.running = False
+
+        if envs.ZMQ_SEND_BATCH_DATA:
+            # Batch mode: PULL client and dispatcher task
+            self.pull_client = None
+            self.dispatcher_task = None
+        else:
+            # Per-query mode: DEALER connections
+            self.max_connections = max(max_connections, 10)
+            self.connections = []
+            self.connection_load = []
+            self.connection_heap = []
+            self.request_num = {}  # request_id -> num_choices
+            self.connection_tasks = []
 
     async def initialize(self):
         """initialize all connections"""
         self.running = True
-        for index in range(self.max_connections):
-            await self._add_connection(index)
-        api_server_logger.info(f"Started {self.max_connections} connections, pid {self.pid}")
+
+        if envs.ZMQ_SEND_BATCH_DATA:
+            # Create PULL client for batch response reception
+            # Each worker binds on a unique address to avoid PUSH round-robin
+            try:
+                self.worker_pid = os.getpid()
+                self.pull_ipc_path = f"/dev/shm/response_{self.pid}_w{self.worker_pid}.pull"
+                self.pull_client = await aiozmq.create_zmq_stream(zmq.PULL, bind=f"ipc://{self.pull_ipc_path}")
+                self.pull_metrics_address = self.pull_client.transport.getsockopt(zmq.LAST_ENDPOINT)
+                # Start dispatcher task
+                self.dispatcher_task = asyncio.create_task(self._dispatch_batch_responses())
+                api_server_logger.info(
+                    f"Started PULL client (bind) for batch response, pid {self.pid}, worker {self.worker_pid}"
+                )
+            except Exception as e:
+                api_server_logger.error(f"Failed to create PULL client: {str(e)}")
+                # Reset running flag and propagate error to avoid hanging requests in batch mode
+                self.running = False
+                raise RuntimeError(
+                    f"Failed to initialize PULL client for batch response "
+                    f"(pid={self.pid}, worker={getattr(self, 'worker_pid', 'unknown')})"
+                ) from e
+        else:
+            for index in range(self.max_connections):
+                await self._add_connection(index)
+            api_server_logger.info(f"Started {self.max_connections} connections, pid {self.pid}")
 
     async def _add_connection(self, index):
         """create a new connection and start listening task"""
@@ -136,11 +176,11 @@ class DealerConnectionManager:
 
                 request_id = response[-1]["request_id"]
                 if request_id[:4] in ["cmpl", "embd"]:
-                    request_id = request_id.rsplit("_", 1)[0]
+                    request_id = get_base_request_id(request_id)
                 elif "reward" == request_id[:6]:
-                    request_id = request_id.rsplit("_", 1)[0]
+                    request_id = get_base_request_id(request_id)
                 elif "chatcmpl" == request_id[:8]:
-                    request_id = request_id.rsplit("_", 1)[0]
+                    request_id = get_base_request_id(request_id)
                 async with self.lock:
                     if request_id in self.request_map:
                         await self.request_map[request_id].put(response)
@@ -148,9 +188,14 @@ class DealerConnectionManager:
                             self.request_num[request_id] -= 1
                             if self.request_num[request_id] == 0:
                                 self._update_load(conn_index, -1)
+                    else:
+                        api_server_logger.warning(
+                            f"request_id {request_id} not in request_map, available keys: {list(self.request_map.keys())}"
+                        )
             except Exception as e:
-                api_server_logger.error(f"Listener error: {str(e)}")
+                api_server_logger.error(f"Listener error: {str(e)}\n{traceback.format_exc()}")
                 break
+        api_server_logger.info(f"Listener loop ended for conn_index {conn_index}")
 
     def _update_load(self, conn_index, delta):
         """Update connection load and maintain the heap"""
@@ -175,28 +220,84 @@ class DealerConnectionManager:
 
         return self.connections[conn_index]
 
+    async def _dispatch_batch_responses(self):
+        """
+        Receive batch responses and dispatch to corresponding request queues.
+        batch_data format: [[output, ...], [output, ...], ...]
+        """
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        while self.running:
+            try:
+                raw_data = await self.pull_client.read()
+                # Deserialize batch response
+                batch_data = msgpack.unpackb(raw_data[-1])
+
+                # Record metrics
+                _zmq_metrics_stats = ZMQMetricsStats()
+                _zmq_metrics_stats.msg_recv_total += 1
+                main_process_metrics.record_zmq_stats(_zmq_metrics_stats, self.pull_metrics_address)
+
+                # Parse req_id from outputs and dispatch in a single pass
+                for outputs in batch_data:
+                    last_output = outputs[-1]
+                    req_id = last_output["request_id"] if isinstance(last_output, dict) else last_output.request_id
+                    if req_id.startswith(("cmpl", "embd", "reward", "chatcmpl")):
+                        req_id = get_base_request_id(req_id)
+                    queue = self.request_map.get(req_id)
+                    if queue is not None:
+                        queue.put_nowait(outputs)
+
+                consecutive_errors = 0
+
+            except (ConnectionError, OSError) as e:
+                if self.running:
+                    api_server_logger.error(f"Dispatcher: connection lost, exiting: {e}, {traceback.format_exc()}")
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                if self.running:
+                    api_server_logger.error(
+                        f"Dispatcher error ({consecutive_errors}/{max_consecutive_errors}): "
+                        f"{e}\n{traceback.format_exc()}"
+                    )
+                if consecutive_errors >= max_consecutive_errors:
+                    api_server_logger.error(f"Dispatcher: {max_consecutive_errors} consecutive errors, exiting")
+                    break
+
     async def get_connection(self, request_id, num_choices=1):
         """get a connection for the request"""
 
         response_queue = asyncio.Queue()
 
-        async with self.lock:
-            self.request_map[request_id] = response_queue
-            self.request_num[request_id] = num_choices
-            dealer = self._get_least_loaded_connection()
-            if not dealer:
-                raise RuntimeError("No available connections")
-
-        return dealer, response_queue
+        if envs.ZMQ_SEND_BATCH_DATA:
+            async with self.lock:
+                self.request_map[request_id] = response_queue
+            return None, response_queue
+        else:
+            async with self.lock:
+                self.request_map[request_id] = response_queue
+                self.request_num[request_id] = num_choices
+                dealer = self._get_least_loaded_connection()
+                if not dealer:
+                    raise RuntimeError("No available connections")
+            return dealer, response_queue
 
     async def cleanup_request(self, request_id):
         """
         clean up the request after it is finished
         """
-        async with self.lock:
-            if request_id in self.request_map:
-                del self.request_map[request_id]
-                del self.request_num[request_id]
+        try:
+            async with self.lock:
+                self.request_map.pop(request_id, None)
+                if not envs.ZMQ_SEND_BATCH_DATA:
+                    self.request_num.pop(request_id, None)
+        except asyncio.CancelledError:
+            # If cancelled during lock acquisition, try cleanup without lock
+            self.request_map.pop(request_id, None)
+            if not envs.ZMQ_SEND_BATCH_DATA:
+                self.request_num.pop(request_id, None)
+            raise
 
     async def close(self):
         """
@@ -204,26 +305,50 @@ class DealerConnectionManager:
         """
         self.running = False
 
-        for task in self.connection_tasks:
-            task.cancel()
+        if envs.ZMQ_SEND_BATCH_DATA:
+            # Cancel dispatcher task
+            if self.dispatcher_task:
+                self.dispatcher_task.cancel()
 
-        async with self.lock:
-            for dealer in self.connections:
+            # Close PULL client
+            if self.pull_client:
                 try:
-                    dealer.close()
+                    self.pull_client.close()
                 except:
                     pass
-            self.connections.clear()
-            self.connection_load.clear()
-            self.request_map.clear()
+
+            # Clean up IPC file created by bind
+            pull_ipc_path = getattr(self, "pull_ipc_path", None)
+            if pull_ipc_path:
+                try:
+                    if os.path.exists(pull_ipc_path):
+                        os.remove(pull_ipc_path)
+                except OSError:
+                    pass
+        else:
+            for task in self.connection_tasks:
+                task.cancel()
+
+            async with self.lock:
+                for dealer in self.connections:
+                    try:
+                        dealer.close()
+                    except:
+                        pass
+                self.connections.clear()
+                self.connection_load.clear()
+
+        # Clear request map
+        self.request_map.clear()
 
         api_server_logger.info("All connections and tasks closed")
 
 
 def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+    _is_multi_server = os.environ.get("FD_ENABLE_MULTI_API_SERVER") == "1"
     parser.add_argument("--port", default=8000, type=int, help="port to the http server")
     parser.add_argument("--host", default="0.0.0.0", type=str, help="host to the http server")
-    parser.add_argument("--workers", default=1, type=int, help="number of workers")
+    parser.add_argument("--workers", default=1 if _is_multi_server else 4, type=int, help="number of workers")
     parser.add_argument("--metrics-port", default=None, type=int, help="port for metrics server")
     parser.add_argument("--controller-port", default=-1, type=int, help="port for controller server")
     parser.add_argument(
@@ -232,7 +357,9 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         type=int,
         help="max waiting time for connection, if set value -1 means no waiting time limit",
     )
-    parser.add_argument("--max-concurrency", default=512, type=int, help="max concurrency")
+    parser.add_argument(
+        "--max-concurrency", default=512 if _is_multi_server else 2048, type=int, help="max concurrency"
+    )
 
     parser.add_argument(
         "--enable-mm-output", action="store_true", help="Enable 'multimodal_content' field in response output. "

@@ -24,11 +24,11 @@ from multiprocessing.managers import (
     Value,
     ValueProxy,
 )
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Union
 
 from fastdeploy.utils import get_logger
 
-logger = get_logger("cache_queue_manager", "cache_queue_manager.log")
+logger = get_logger("cache_queue_manager", "cache_manager.log")
 
 
 class EngineCacheQueue:
@@ -39,7 +39,7 @@ class EngineCacheQueue:
 
     def __init__(
         self,
-        address: Tuple[str, int] = ("127.0.0.1", 56666),
+        address: Union[Tuple[str, int], str] = ("127.0.0.1", 56666),
         authkey: bytes = b"cache_queue_service",
         is_server: bool = False,
         num_client: int = 1,  # tensor parallel size
@@ -58,8 +58,11 @@ class EngineCacheQueue:
             client_id: Unique identifier for client instances
             local_data_parallel_size: data parallel size
             local_data_parallel_id: local data parallel id
+
+        TODO(liyonghua): Remove multi-DP initialization. Each DP will have its own cache queue.
+
         """
-        self.address: Tuple[str, int] = address
+        self.address: Union[Tuple[str, int], str] = address
         self.authkey: bytes = authkey
         self.is_server: bool = is_server
         self.num_client: int = num_client
@@ -87,6 +90,7 @@ class EngineCacheQueue:
             ]
 
             # Initialize barriers
+            self.barrier = [threading.Barrier(self.num_client) for _ in range(self.local_data_parallel_size)]
             self.barrier0_init = [threading.Barrier(self.num_client) for _ in range(self.local_data_parallel_size)]
             self.barrier1_init = [threading.Barrier(self.num_client) for _ in range(self.local_data_parallel_size)]
             self.barrier2_init = [threading.Barrier(self.num_client) for _ in range(self.local_data_parallel_size)]
@@ -142,6 +146,7 @@ class EngineCacheQueue:
                 callable=lambda idx: self.transfer_task_done_lock_init[idx],
                 proxytype=AcquirerProxy,
             )
+            QueueManager.register("get_barrier", callable=lambda idx: self.barrier[idx])
             QueueManager.register("get_barrier0", callable=lambda idx: self.barrier0_init[idx])
             QueueManager.register("get_barrier1", callable=lambda idx: self.barrier1_init[idx])
             QueueManager.register("get_barrier2", callable=lambda idx: self.barrier2_init[idx])
@@ -180,7 +185,7 @@ class EngineCacheQueue:
             # After manager.start(), its address attribute will be updated to the actual listening address.
             # We update self.address here so that the real address can be queried later.
             self.address = self.manager.address
-            logger.info(f"EngineCacheQueue server started at {self.address}")
+            logger.debug(f"EngineCacheQueue server started at {self.address}")
         else:
             # Client-side connection setup
             assert (
@@ -191,6 +196,7 @@ class EngineCacheQueue:
             QueueManager.register("get_cache_sync_value")
             QueueManager.register("get_transfer_task_lock")
             QueueManager.register("get_transfer_task_done_lock")
+            QueueManager.register("get_barrier")
             QueueManager.register("get_barrier0")
             QueueManager.register("get_barrier1")
             QueueManager.register("get_barrier2")
@@ -204,8 +210,10 @@ class EngineCacheQueue:
             QueueManager.register("get_swap_storage_to_gpu_barrier")
             QueueManager.register("get_swap_to_storage_barrier")
 
+            logger.info(f"Try to connect QueueManager, address: {self.address}")
             self.manager = QueueManager(address=self.address, authkey=self.authkey)
             self._connect_with_retry()
+            logger.info(f"Connected to QueueManager, address: {self.address}")
 
         # Get proxy objects for shared resources
         self.transfer_task_queue = self.manager.get_transfer_task_queue(self.local_data_parallel_id)
@@ -215,6 +223,7 @@ class EngineCacheQueue:
         self.task_done_lock = self.manager.get_transfer_task_done_lock(self.local_data_parallel_id)
 
         # Get barrier proxies
+        self.barrier = self.manager.get_barrier(self.local_data_parallel_id)
         self.barrier0 = self.manager.get_barrier0(self.local_data_parallel_id)
         self.barrier1 = self.manager.get_barrier1(self.local_data_parallel_id)
         self.barrier2 = self.manager.get_barrier2(self.local_data_parallel_id)
@@ -232,14 +241,14 @@ class EngineCacheQueue:
         if not is_server:
             # Setup position and total_num for sync operations
             self.position: int = 1 << self.client_id
-            logger.info(f"Connected EngineCacheQueue client_id: {self.client_id}")
+            logger.debug(f"Connected EngineCacheQueue client_id: {self.client_id}")
 
     def get_server_port(self) -> int:
         """
         Returns the actual port that the server instance is listening on.
         Calling this method only makes sense on instances where is_server=True.
         """
-        if not self.is_server:
+        if not self.is_server or isinstance(self.address, str):
             raise RuntimeError("Only the server instance can provide the port.")
         return self.address[1]
 
@@ -264,7 +273,12 @@ class EngineCacheQueue:
 
     def put_transfer_task(self, item):
         """
-        put swap task
+        Enqueue a cache transfer task (cpu/gpu swap task, read/write storage task)
+        or a control task (cache clearing/restoring).
+
+        The queue is shared by multiple clients. A task can be enqueued only after
+        the previous task has been read by all clients.
+        `task_sync_value` is used as a bitmask to track per-client read status.
         """
         self.task_lock.acquire()
         if 0 < self.task_sync_value.get() < self.total_num:
@@ -274,12 +288,16 @@ class EngineCacheQueue:
             self.task_lock.acquire()
         self.task_sync_value.set(0)
         self.transfer_task_queue.append(item)
-        logger.info(f"put_transfer_task: put swap task {item} to queue successful")
+        logger.debug(f"put_transfer_task: put swap task {item} to queue successful")
         self.task_lock.release()
 
     def get_transfer_task(self):
         """
-        get swap task
+        Get the current cache transfer task (cpu/gpu swap task, read/write storage task)
+        or control signal (cache clearing/restoring) from cache task queue.
+
+        Each client reads the same task once. The task is removed from the queue
+        only after all clients have read it, tracked by `task_sync_value`.
         """
         data = None
         read_finish = False
@@ -288,7 +306,7 @@ class EngineCacheQueue:
             data = self.transfer_task_queue[0]
             logger.debug(f"get_transfer_task: Get {data} by {self.client_id} from queue successful")
             set_value = self.task_sync_value.get() | self.position
-            logger.info(f"get_transfer_task: rank: {self.client_id} set_value: {set_value}")
+            logger.debug(f"get_transfer_task: rank: {self.client_id} set_value: {set_value}")
             if set_value >= self.total_num:
                 self.transfer_task_queue.pop(0)
                 set_value = 0
@@ -307,7 +325,7 @@ class EngineCacheQueue:
         self.task_sync_value.set(0)
         while len(self.transfer_task_queue) > 0:
             self.transfer_task_queue.pop(0)
-        logger.info("clear_transfer_task: done")
+        logger.debug("clear_transfer_task: done")
         self.task_lock.release()
 
     def put_transfer_done_signal(self, item):
@@ -317,7 +335,7 @@ class EngineCacheQueue:
         self.task_done_lock.acquire()
         self.tansfer_done_queue.append(item)
         self.task_done_lock.release()
-        logger.info(f"put_transfer_done_signal: put swap task {item[-1]} finished signal to queue successful")
+        logger.debug(f"put_transfer_done_signal: put swap task {item[-1]} finished signal to queue successful")
 
     def get_transfer_done_signal(self):
         """
@@ -327,7 +345,7 @@ class EngineCacheQueue:
         self.task_done_lock.acquire()
         if len(self.tansfer_done_queue) > 0:
             data = self.tansfer_done_queue.pop(0)
-            logger.info(f"get_transfer_done_signal: Get swap task {data[-1]} finished signal from queue successful")
+            logger.debug(f"get_transfer_done_signal: Get swap task {data[-1]} finished signal from queue successful")
         self.task_done_lock.release()
         return data
 

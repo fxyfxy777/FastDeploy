@@ -66,7 +66,7 @@ class SimpleCollector(Collector):
             Metric: Prometheus Metric objects that are not excluded.
         """
         for metric in self.base_registry.collect():
-            if not any(name.startswith(metric.name) for name in self.exclude_names):
+            if not any(metric.name.startswith(name) for name in self.exclude_names):
                 yield metric
 
 
@@ -84,11 +84,15 @@ def get_filtered_metrics() -> str:
         multiprocess.MultiProcessCollector(base_registry)
 
         filtered_registry = CollectorRegistry()
-        # 注册一个新的colletor，过滤gauge指标
-        filtered_registry.register(SimpleCollector(base_registry, EXCLUDE_LABELS))
+        # 动态获取需要排除的 gauge 指标列表
+        exclude_labels = main_process_metrics.get_excluded_metrics()
+        # 注册一个新的collector，过滤gauge指标
+        filtered_registry.register(SimpleCollector(base_registry, exclude_labels))
 
         # 将gauge指标重新注册到filtered_registry中，从内存中读取
         main_process_metrics.re_register_gauge(filtered_registry)
+        # 将speculative中的gauge指标也重新注册
+        main_process_metrics.re_register_speculative_gauge(filtered_registry)
 
         return generate_latest(filtered_registry).decode("utf-8")
 
@@ -132,6 +136,7 @@ class MetricsManager:
 
     num_requests_running: "Gauge"
     num_requests_waiting: "Gauge"
+    num_requests_queuing: "Gauge"
     time_to_first_token: "Histogram"
     time_per_output_token: "Histogram"
     request_inference_time: "Histogram"
@@ -149,7 +154,6 @@ class MetricsManager:
     spec_decode_num_emitted_tokens_total: "Gauge"
     spec_decode_draft_single_head_acceptance_rate: "list[Gauge]"
 
-    # for YIYAN Adapter
     prefix_cache_token_num: "Counter"
     prefix_gpu_cache_token_num: "Counter"
     prefix_cpu_cache_token_num: "Counter"
@@ -188,6 +192,11 @@ class MetricsManager:
     request_prompt_tokens: "Histogram"
     request_token_ratio: "Histogram"
 
+    # for pd
+    decode_preallocated_req_num: "Gauge"
+    reschedule_req_num: "Counter"
+    failed_recv_first_token_req_num: "Counter"
+
     # 定义所有指标配置
 
     # gauge指标在多进程中，会有pid隔离，需要特殊处理，因此手动定义出来
@@ -196,12 +205,18 @@ class MetricsManager:
             "type": Gauge,
             "name": "fastdeploy:num_requests_running",
             "description": "Number of requests currently running",
-            "kwargs": {"multiprocess_mode": "sum"},
+            "kwargs": {},
         },
         "num_requests_waiting": {
             "type": Gauge,
             "name": "fastdeploy:num_requests_waiting",
-            "description": "Number of requests currently waiting",
+            "description": "Number of requests currently waiting in resource manager",
+            "kwargs": {},
+        },
+        "num_requests_queuing": {
+            "type": Gauge,
+            "name": "fastdeploy:num_requests_queuing",
+            "description": "Number of requests currently queuing in local scheduler",
             "kwargs": {},
         },
         "gpu_cache_usage_perc": {
@@ -292,6 +307,12 @@ class MetricsManager:
             "type": Gauge,
             "name": "fastdeploy:gpu_hit_token_rate",
             "description": "Token-level GPU prefix cache hit rate",
+            "kwargs": {},
+        },
+        "decode_preallocated_req_num": {
+            "type": Gauge,
+            "name": "fastdeploy:decode_preallocated_req_num",
+            "description": "Number of preallocated requests in decode instance",
             "kwargs": {},
         },
     }
@@ -454,6 +475,18 @@ class MetricsManager:
                     60,
                 ],
             },
+        },
+        "reschedule_req_num": {
+            "type": Counter,
+            "name": "fastdeploy:reschedule_req_num",
+            "description": "Total number of reschedule requests",
+            "kwargs": {},
+        },
+        "failed_recv_first_token_req_num": {
+            "type": Counter,
+            "name": "fastdeploy:failed_recv_first_token_req_num",
+            "description": "Total number of failed requests to receive the first token in decode",
+            "kwargs": {},
         },
     }
 
@@ -626,19 +659,22 @@ class MetricsManager:
         # 在模块加载，指标注册先设置Prometheus环境变量
         setup_multiprocess_prometheus()
 
-        # 动态创建所有指标
+        # 动态创建所有非 gauge 型指标
         for metric_name, config in self.METRICS.items():
             setattr(
                 self,
                 metric_name,
                 config["type"](config["name"], config["description"], **config["kwargs"]),
             )
-        # 动态创建所有指标
+        # 动态创建所有 gauge 型指标，统一配置 multiprocess_mode 为 livesum
         for metric_name, config in self.GAUGE_METRICS.items():
+            kwargs = config["kwargs"].copy()
+            if "multiprocess_mode" not in kwargs:
+                kwargs["multiprocess_mode"] = "livesum"
             setattr(
                 self,
                 metric_name,
-                config["type"](config["name"], config["description"], **config["kwargs"]),
+                config["type"](config["name"], config["description"], **kwargs),
             )
         # 动态创建server metrics
         for metric_name, config in self.SERVER_METRICS.items():
@@ -696,17 +732,22 @@ class MetricsManager:
                         Gauge(
                             f"{config['name']}_{i}",
                             f"{config['description']} (head {i})",
+                            multiprocess_mode="livesum",
                         )
                     )
                     setattr(self, metric_name, gauges)
             else:
+                # For Gauge metrics, automatically add multiprocess_mode="livesum"
+                kwargs = config["kwargs"].copy()
+                if config["type"] == Gauge and "multiprocess_mode" not in kwargs:
+                    kwargs["multiprocess_mode"] = "livesum"
                 setattr(
                     self,
                     metric_name,
                     config["type"](
                         config["name"],
                         config["description"],
-                        **config["kwargs"],
+                        **kwargs,
                     ),
                 )
 
@@ -767,6 +808,19 @@ class MetricsManager:
             else:
                 registry.register(getattr(self, metric_name))
 
+    def re_register_speculative_gauge(self, registry: CollectorRegistry):
+        """Re-register gauge metrics from SPECULATIVE_METRICS to the specified registry"""
+        # Check if SPECULATIVE_METRICS was initialized in this process
+        # (it's an instance attribute set by _init_speculative_metrics, not the class-level empty dict)
+        if not hasattr(self, "spec_decode_draft_acceptance_rate"):
+            return
+        for metric_name, config in self.SPECULATIVE_METRICS.items():
+            if metric_name == "spec_decode_draft_single_head_acceptance_rate":
+                for gauge in getattr(self, metric_name):
+                    registry.register(gauge)
+            elif config["type"] == Gauge:
+                registry.register(getattr(self, metric_name))
+
     def re_register_gauge(self, registry: CollectorRegistry):
         """Re-register gauge to the specified registry"""
         for metric_name in self.GAUGE_METRICS:
@@ -790,10 +844,15 @@ class MetricsManager:
         if hasattr(main_process_metrics, "spec_decode_draft_acceptance_rate"):
             self.register_speculative_metrics(registry)
 
-    @classmethod
-    def get_excluded_metrics(cls) -> Set[str]:
+    def get_excluded_metrics(self) -> Set[str]:
         """Get the set of indicator names that need to be excluded"""
-        return {config["name"] for config in cls.GAUGE_METRICS.values()}
+        excluded = {config["name"] for config in self.GAUGE_METRICS.values()}
+        # Also add gauge metrics from SPECULATIVE_METRICS (if initialized)
+        if hasattr(self, "SPECULATIVE_METRICS"):
+            for config in self.SPECULATIVE_METRICS.values():
+                if config["type"] == Gauge or config["type"] == list[Gauge]:
+                    excluded.add(config["name"])
+        return excluded
 
 
 main_process_metrics = MetricsManager()
@@ -801,5 +860,3 @@ main_process_metrics = MetricsManager()
 # 由于zmq指标记录比较耗时，默认不开启，通过DEBUG参数开启
 if envs.FD_DEBUG:
     main_process_metrics.init_zmq_metrics()
-
-EXCLUDE_LABELS = MetricsManager.get_excluded_metrics()

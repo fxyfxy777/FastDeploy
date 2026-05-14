@@ -26,7 +26,7 @@ from paddleformers.utils.log import logger
 
 from fastdeploy import envs
 from fastdeploy.config import FDConfig
-from fastdeploy.envs import FD_FILL_BITMASK_BATCH
+from fastdeploy.envs import FD_FILL_BITMASK_BATCH, FD_SAMPLING_CLASS
 from fastdeploy.logger.deterministic_logger import _record_logits_diagnostic
 from fastdeploy.model_executor.guided_decoding import LogitsProcessorBase
 from fastdeploy.model_executor.layers.sample.early_stopper import (
@@ -45,13 +45,88 @@ from fastdeploy.model_executor.layers.sample.ops import (
     speculate_insert_first_token,
     top_k_top_p_sampling,
 )
+from fastdeploy.model_executor.layers.sample.ops.top_k_top_p_triton import (
+    apply_top_k_top_p_triton,
+    seeded_gumbel_noise,
+)
 from fastdeploy.platforms import current_platform
 from fastdeploy.reasoning import ReasoningParser
 from fastdeploy.spec_decode import SpecMethod, VerifyStrategy
 from fastdeploy.worker.output import LogprobsTensors, SamplerOutput
 
 if current_platform.is_cuda():
-    from fastdeploy.model_executor.ops.gpu import build_sampling_params
+    from fastdeploy.model_executor.ops.gpu import (
+        build_sampling_params,
+        build_sampling_params_logprob,
+        naive_update_model_status,
+    )
+
+
+def _apply_triton_top_k_top_p(
+    logits: paddle.Tensor,
+    top_p: paddle.Tensor,
+    top_k: Optional[paddle.Tensor] = None,
+    top_k_list: Optional[list] = None,
+    return_mask: bool = False,
+) -> paddle.Tensor | tuple[paddle.Tensor, paddle.Tensor]:
+    """
+    Apply combined top-k/top-p masking on logits using the Triton kernel.
+    Masked positions are set to -inf in-place. Call this BEFORE softmax.
+
+    Args:
+        return_mask: If True, return (logits, mask) where mask is a bool
+            tensor [B, V] computed inside the Triton kernel (zero extra cost).
+
+    Returns:
+        logits if return_mask is False, else (logits, mask).
+    """
+    if top_p is None and top_k is None:
+        return logits
+    batch_size = logits.shape[0]
+
+    top_p = top_p[:batch_size].squeeze(axis=-1)
+
+    has_top_k = top_k_list and any(x > 0 for x in top_k_list)
+    if has_top_k:
+        top_k = top_k[:batch_size].squeeze(axis=-1)
+    else:
+        top_k = None
+
+    return apply_top_k_top_p_triton(logits.astype("float32"), k=top_k, p=top_p, return_mask=return_mask)
+
+
+def _random_sample(
+    probs: paddle.Tensor,
+    topp_seed: Optional[paddle.Tensor] = None,
+) -> paddle.Tensor:
+    """
+    Sample from probabilities using the Gumbel-max trick.
+
+    Equivalent to multinomial sampling but avoids CPU-GPU synchronization.
+    When ``topp_seed`` is provided and Triton is available, a Triton kernel
+    generates per-row deterministic Gumbel noise using Philox PRNG entirely
+    on GPU, eliminating the Python for-loop and CPU-GPU sync overhead.
+
+    Args:
+        probs: [batch_size, vocab_size] float32 probabilities.
+        topp_seed: [batch_size, 1] int64 per-request seeds, or None.
+
+    Returns:
+        Token ids of shape [batch_size, 1].
+
+    Reference: vllm/v1/sample/ops/topk_topp_sampler.py::random_sample
+    """
+    # Sample from Exp(1): q = -log(u), u ~ Uniform(0, 1)
+    if topp_seed is not None:
+        seeds = topp_seed[: probs.shape[0]].reshape([-1])
+        if not seeds.place.is_gpu_place():
+            seeds = seeds.cuda()
+        q = seeded_gumbel_noise(probs, seeds)
+    else:
+        u = paddle.uniform(probs.shape, dtype=probs.dtype, min=0.0, max=1.0)
+        q = -paddle.log(u.clip(min=1e-10))
+    # Gumbel-max: argmax(probs / q) is equivalent to multinomial(probs)
+    return (probs / q).argmax(axis=-1).reshape([-1, 1])
 
 
 def top_p_normalize_probs_paddle(
@@ -73,7 +148,10 @@ def padding_sampling_params(top_p, top_k, infer_seed, seq_lens_this_time, seq_le
     top_k_padding = paddle.repeat_interleave(top_k[:real_bsz], repeats).unsqueeze(1)
     topp_seed = paddle.repeat_interleave(infer_seed[:real_bsz], repeats).unsqueeze(1)
 
-    MAX_INFER_SEED = 9223372036854775806
+    if current_platform.is_xpu():
+        MAX_INFER_SEED = 2147483646
+    else:
+        MAX_INFER_SEED = 9223372036854775806
 
     token_lens = paddle.where(
         seq_lens_encoder[:real_bsz] == 0,
@@ -93,7 +171,7 @@ def padding_sampling_params(top_p, top_k, infer_seed, seq_lens_this_time, seq_le
 
     offsets = paddle.where(
         is_decoder,
-        local_pos * 4,
+        local_pos * (32 if current_platform.is_xpu() else 4),
         paddle.zeros_like(local_pos),
     )
 
@@ -521,7 +599,6 @@ class Sampler(nn.Layer):
 
         for proc in sampling_metadata.logits_processors or []:
             logits = proc.apply(logits)
-
         logits = apply_penalty_multi_scores(
             sampling_metadata.token_ids_all,
             logits,
@@ -544,6 +621,16 @@ class Sampler(nn.Layer):
             elif self.logprobs_mode == "processed_logits":
                 raw_logprobs = logits.clone()
 
+        # Triton path: mask logits in-place BEFORE softmax (no probs→log round-trip).
+        if FD_SAMPLING_CLASS.lower() == "triton":
+            logits = _apply_triton_top_k_top_p(
+                logits,
+                sampling_metadata.top_p,
+                top_k=sampling_metadata.top_k,
+                top_k_list=sampling_metadata.top_k_list,
+                return_mask=False,
+            )
+
         probs = F.softmax(logits)
 
         # Record post-penalty logits and probs MD5 for determinism diagnosis
@@ -551,13 +638,16 @@ class Sampler(nn.Layer):
             _record_logits_diagnostic(logits, tag="post_penalty_logits", probs=probs)
 
         probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
-        _, next_tokens = top_k_top_p_sampling(
-            probs,
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.top_k_list,
-            topp_seed=sampling_metadata.seed,
-        )
+        if FD_SAMPLING_CLASS.lower() == "triton":
+            next_tokens = _random_sample(probs, topp_seed=sampling_metadata.seed)
+        else:
+            _, next_tokens = top_k_top_p_sampling(
+                probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
 
         logprobs_tensors = (
             None if num_logprobs is None else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=next_tokens)
@@ -651,6 +741,7 @@ class SpeculativeSampler(nn.Layer):
         self.spec_method = spec_config.method
         self.verify_strategy = spec_config.verify_strategy
         self.prefill_one_step_stop = fd_config.parallel_config.prefill_one_step_stop
+        self.num_speculative_tokens = spec_config.num_speculative_tokens
 
         # Accept policy from config (can be overridden by function parameters)
         self.config_accept_all = spec_config.accept_policy == "accept_all"
@@ -676,54 +767,54 @@ class SpeculativeSampler(nn.Layer):
         self,
         logits: paddle.Tensor,
         sampling_metadata: SamplingMetadata,
+        real_bsz: int = 0,
     ) -> paddle.Tensor:
         """compute logprobs"""
         share_inputs = sampling_metadata.share_inputs
         last_logits = logits
-        real_bsz = share_inputs["seq_lens_this_time"].shape[0]
-        batch_token_num = share_inputs["accept_num"][:real_bsz]
+
+        # NOTE(huicongyao): temporarily used to provide a max_sized input, remove in the future
+        num_tokens = real_bsz * (self.num_speculative_tokens + 1)
+        padded_logits = paddle.zeros(shape=[num_tokens, last_logits.shape[1]], dtype=last_logits.dtype)
+        padded_logits[: logits.shape[0]] = last_logits
+        max_occupied_slots = share_inputs["seq_lens_this_time"].shape[0]
+
+        batch_token_num = share_inputs["accept_num"][:max_occupied_slots]
 
         temp_scaled_logprobs = sampling_metadata.temp_scaled_logprobs
         top_p_normalized_logprobs = sampling_metadata.top_p_normalized_logprobs
         if temp_scaled_logprobs is not None:
-            real_bsz_temp_scaled = temp_scaled_logprobs[:real_bsz]
-            temperature = sampling_metadata.temperature[:real_bsz]
-            real_bsz_temp_scaled = (
-                real_bsz_temp_scaled.astype("int32").squeeze(1).repeat_interleave(batch_token_num).astype("bool")
-            )
-            temperature = temperature.squeeze(1).repeat_interleave(batch_token_num)
+            real_bsz_temp_scaled = temp_scaled_logprobs[:max_occupied_slots]
+            temperature = sampling_metadata.temperature[:max_occupied_slots]
+            real_bsz_temp_scaled = build_sampling_params_logprob(real_bsz_temp_scaled, batch_token_num, num_tokens)
+            temperature = build_sampling_params_logprob(temperature, batch_token_num, num_tokens)
             temp_temperature = paddle.where(
                 real_bsz_temp_scaled, temperature, paddle.ones_like(temperature)
             ).unsqueeze(1)
-            last_logits = last_logits / temp_temperature
+            padded_logits = padded_logits / temp_temperature
 
-        last_logprobs = F.log_softmax(last_logits, axis=-1)
+        last_logprobs = F.log_softmax(padded_logits, axis=-1)
         top_p_logprob = None
         top_p_token_mask = None
-
         if (
             top_p_normalized_logprobs is not None
             and share_inputs is not None
             and sampling_metadata.top_p_normalized_logprobs_flag
         ):
-            real_token_top_p = (
-                sampling_metadata.top_p[:real_bsz].squeeze(1).repeat_interleave(batch_token_num).unsqueeze(1)
-            )
-            top_p_normalized_logprobs = (
-                top_p_normalized_logprobs[:real_bsz]
-                .astype("int32")
-                .squeeze(1)
-                .repeat_interleave(batch_token_num)
-                .astype("bool")
-                .unsqueeze(1)
-            )
+            real_token_top_p = build_sampling_params_logprob(
+                sampling_metadata.top_p[:max_occupied_slots].squeeze(1), batch_token_num, num_tokens
+            ).unsqueeze(1)
+            top_p_normalized_logprobs = build_sampling_params_logprob(
+                top_p_normalized_logprobs[:max_occupied_slots].squeeze(1), batch_token_num, num_tokens
+            ).unsqueeze(1)
             top_p_token_mask = paddle.logical_and(top_p_normalized_logprobs, real_token_top_p != 1.0)
-            if top_p_token_mask.any():
-                probs = F.softmax(last_logits, axis=-1)
-                probs = top_p_normalize_probs_paddle(probs, real_token_top_p)
-                top_p_logprob = paddle.log(probs)
+
+            probs = F.softmax(padded_logits, axis=-1)
+            probs = top_p_normalize_probs_paddle(probs, real_token_top_p)
+            top_p_logprob = paddle.log(probs)
         if top_p_logprob is not None:
             last_logprobs = paddle.where(top_p_token_mask, top_p_logprob, last_logprobs)
+
         return last_logprobs
 
     def gather_logprobs(
@@ -766,7 +857,18 @@ class SpeculativeSampler(nn.Layer):
             indices = token_ids
             top_logprobs = token_logprobs
 
-        return LogprobsTensors(indices, top_logprobs, token_ranks)
+        if current_platform.is_cuda():
+            indices_cpu = paddle.empty_like(indices, device="cpu").pin_memory()
+            top_logprobs_cpu = paddle.empty_like(top_logprobs, device="cpu").pin_memory()
+            token_ranks_cpu = paddle.empty_like(token_ranks, device="cpu").pin_memory()
+            indices_cpu.copy_(indices, False)
+            top_logprobs_cpu.copy_(top_logprobs, False)
+            token_ranks_cpu.copy_(token_ranks, False)
+        else:
+            indices_cpu = indices.cpu()
+            top_logprobs_cpu = top_logprobs.cpu()
+            token_ranks_cpu = token_ranks.cpu()
+        return LogprobsTensors(indices_cpu, top_logprobs_cpu, token_ranks_cpu)
 
     def _verify_and_sample(
         self,
@@ -810,17 +912,22 @@ class SpeculativeSampler(nn.Layer):
         target_tokens, candidate_ids, candidate_scores, candidate_lens = None, None, None, None
 
         if self.verify_strategy == VerifyStrategy.TARGET_MATCH:
-            # Only TARGET_MATCH needs stochastic sampling
-            top_p, top_k, topp_seed = build_sampling_params(
-                sampling_metadata.top_p,
-                sampling_metadata.top_k,
-                sampling_metadata.seed,
-                share_inputs["seq_lens_this_time"],
-                share_inputs["cu_seqlens_q_output"],
-                token_num_output_cpu,
-                increment_value,
-            )
-            _, target_tokens = top_k_top_p_sampling(probs, top_p=top_p, top_k=top_k, topp_seed=topp_seed)
+            if FD_SAMPLING_CLASS.lower() == "triton":
+                target_tokens = _random_sample(probs, topp_seed=sampling_metadata.seed)
+            else:
+                # Only TARGET_MATCH needs stochastic sampling
+                top_p, top_k, topp_seed = build_sampling_params(
+                    sampling_metadata.top_p,
+                    sampling_metadata.top_k,
+                    sampling_metadata.seed,
+                    share_inputs["seq_lens_this_time"],
+                    share_inputs["cu_seqlens_q_output"],
+                    token_num_output_cpu,
+                    increment_value,
+                )
+                _, target_tokens = top_k_top_p_sampling(
+                    probs, top_p=top_p, top_k=top_k, top_k_list=sampling_metadata.top_k_list, topp_seed=topp_seed
+                )
         elif self.verify_strategy == VerifyStrategy.GREEDY:
             # GREEDY: deterministic argmax in target_tokens, no candidates needed
             target_tokens = paddle.argmax(probs, axis=-1)
@@ -890,7 +997,8 @@ class SpeculativeSampler(nn.Layer):
         Normal sampling without draft token verification.
 
         Used by NAIVE mode: directly samples from target model output
-        and writes results to share_inputs["accept_tokens"]/["accept_num"].
+        and writes results to share_inputs["accept_tokens"]/["accept_num"]
+        via naive_update_model_status (scatter by cu_seqlens_q_output).
 
         Args:
             probs: Target model softmax output
@@ -905,16 +1013,26 @@ class SpeculativeSampler(nn.Layer):
         probs = min_p_sampling(probs, sampling_metadata.min_p, sampling_metadata.min_p_list)
 
         # Sample tokens
-        _, next_tokens = top_k_top_p_sampling(
-            probs,
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.top_k_list,
-            topp_seed=sampling_metadata.seed,
-        )
+        if FD_SAMPLING_CLASS.lower() == "triton":
+            next_tokens = _random_sample(probs, topp_seed=sampling_metadata.seed)
+        else:
+            _, next_tokens = top_k_top_p_sampling(
+                probs,
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.top_k_list,
+                topp_seed=sampling_metadata.seed,
+            )
 
-        # For NAIVE mode: write directly to accept_tokens/accept_num
-        share_inputs["accept_tokens"][: next_tokens.shape[0], 0] = next_tokens.squeeze(-1)
+        # Scatter sampled tokens into accept_tokens using cu_seqlens_q_output to
+        # correctly handle mixed prefill+decode batches where token index != batch index.
+        naive_update_model_status(
+            share_inputs["accept_tokens"],
+            share_inputs["accept_num"],
+            share_inputs["seq_lens_this_time"],
+            next_tokens.squeeze(-1),
+            share_inputs["cu_seqlens_q_output"],
+        )
 
         return SamplerOutput(
             sampled_token_ids=share_inputs["accept_tokens"],
@@ -933,6 +1051,7 @@ class SpeculativeSampler(nn.Layer):
         increment_value: int,
         accept_all_drafts: bool = False,
         reject_all_drafts: bool = False,
+        real_bsz: int = 0,
     ) -> SamplerOutput:
         """
         Forward pass for speculative sampling.
@@ -983,7 +1102,8 @@ class SpeculativeSampler(nn.Layer):
         if self.enf_gen_phase_tag:
             reasoning_phase_token_constraint(
                 logits,
-                sampling_metadata.pre_token_ids,
+                token_ids_all,
+                prompt_lens,
                 share_inputs["stop_flags"],
                 share_inputs["seq_lens_this_time"],
                 share_inputs["seq_lens_encoder"],
@@ -995,6 +1115,25 @@ class SpeculativeSampler(nn.Layer):
                 share_inputs["enable_thinking"],
                 self.think_end_id,
                 self.line_break_id,
+            )
+
+        logits_ori = None
+        if FD_SAMPLING_CLASS.lower() == "triton":
+            logits_ori = logits.clone()
+            top_p, top_k, _ = build_sampling_params(
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.seed,
+                share_inputs["seq_lens_this_time"],
+                share_inputs["cu_seqlens_q_output"],
+                token_num_output_cpu,
+                increment_value,
+            )
+            logits = _apply_triton_top_k_top_p(
+                logits,
+                top_p,
+                top_k=top_k,
+                top_k_list=sampling_metadata.top_k_list,
             )
 
         probs = F.softmax(logits)
@@ -1019,17 +1158,134 @@ class SpeculativeSampler(nn.Layer):
         # Build logprobs via unified path (outside of sampling logic)
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors, cu_batch_token_offset = build_output_logprobs(
-                logits,
+                logits if logits_ori is None else logits_ori,
                 sampling_metadata,
                 share_inputs,
                 is_naive=is_naive,
                 logprobs_mode=self.logprobs_mode,
                 compute_logprobs_fn=self.compute_logprobs,
+                real_bsz=real_bsz,
             )
             sampler_output.logprobs_tensors = logprobs_tensors
             if cu_batch_token_offset is not None:
-                sampler_output.cu_batch_token_offset = cu_batch_token_offset
+                cu_batch_token_offset_cpu = paddle.empty_like(cu_batch_token_offset, device="cpu").pin_memory()
+                cu_batch_token_offset_cpu.copy_(cu_batch_token_offset, False)
+                sampler_output.cu_batch_token_offset = cu_batch_token_offset_cpu
         return sampler_output
+
+    def _normal_sample_xpu(
+        self,
+        logits: paddle.Tensor,
+        probs: paddle.Tensor,
+        sampling_metadata: SamplingMetadata,
+        share_inputs: List[paddle.Tensor],
+    ) -> SamplerOutput:
+        """Normal sampling for NAIVE mode on XPU."""
+        top_p, top_k, topp_seed = padding_sampling_params(
+            sampling_metadata.top_p,
+            sampling_metadata.top_k,
+            sampling_metadata.seed,
+            paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]),
+            paddle.reshape(share_inputs["seq_lens_encoder"], shape=[-1]),
+        )
+        _, next_tokens = top_k_top_p_sampling(
+            probs,
+            top_p=top_p,
+            top_k=top_k,
+            top_k_list=sampling_metadata.top_k_list,
+            topp_seed=topp_seed,
+        )
+        real_bsz = share_inputs["seq_lens_this_time"].shape[0]
+        running_mask = (paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]) > 0).cast("int32")
+        share_inputs["accept_tokens"][:real_bsz, 0] = next_tokens.squeeze(-1)
+        share_inputs["accept_num"][:real_bsz] = running_mask
+        return SamplerOutput(
+            sampled_token_ids=share_inputs["accept_tokens"],
+            logprobs_tensors=None,
+            token_num_per_batch=share_inputs["accept_num"],
+            logits=logits,
+        )
+
+    def _verify_and_sample_xpu(
+        self,
+        logits: paddle.Tensor,
+        probs: paddle.Tensor,
+        sampling_metadata: SamplingMetadata,
+        max_model_len: int,
+        share_inputs: List[paddle.Tensor],
+        accept_all_drafts: bool = False,
+        reject_all_drafts: bool = False,
+    ) -> SamplerOutput:
+        """Verify draft tokens (MTP/Ngram mode) on XPU using verify_draft_tokens."""
+        from fastdeploy.model_executor.ops.xpu import (
+            top_p_candidates,
+            verify_draft_tokens,
+        )
+
+        target_tokens = None
+        candidate_ids, candidate_scores, candidate_lens = None, None, None
+
+        if self.verify_strategy == VerifyStrategy.TARGET_MATCH:
+            top_p, top_k, topp_seed = padding_sampling_params(
+                sampling_metadata.top_p,
+                sampling_metadata.top_k,
+                sampling_metadata.seed,
+                paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]),
+                paddle.reshape(share_inputs["seq_lens_encoder"], shape=[-1]),
+            )
+            _, target_tokens = top_k_top_p_sampling(
+                probs,
+                top_p=top_p,
+                top_k=top_k,
+                top_k_list=sampling_metadata.top_k_list,
+                topp_seed=topp_seed,
+            )
+        elif self.verify_strategy == VerifyStrategy.GREEDY:
+            target_tokens = paddle.argmax(probs, axis=-1)
+        elif self.verify_strategy == VerifyStrategy.TOPP:
+            candidate_scores, candidate_ids, candidate_lens = top_p_candidates(
+                probs,
+                sampling_metadata.top_p,
+                share_inputs["batch_id_per_token_output"],
+                self.speculative_max_candidate_len,
+                max_model_len,
+            )
+        else:
+            raise ValueError(f"Unknown verify strategy: {self.verify_strategy}")
+
+        final_accept_all = self.config_accept_all or accept_all_drafts
+        final_reject_all = self.config_reject_all or reject_all_drafts or self.speculative_benchmark_mode
+
+        verify_draft_tokens(
+            share_inputs["accept_tokens"],
+            share_inputs["accept_num"],
+            share_inputs["draft_tokens"],
+            target_tokens,
+            candidate_ids,
+            candidate_scores,
+            candidate_lens,
+            sampling_metadata.top_p,
+            share_inputs["stop_flags"],
+            share_inputs["seq_lens_encoder"],
+            share_inputs["seq_lens_this_time"],
+            sampling_metadata.eos_token_ids,
+            share_inputs["is_block_step"],
+            share_inputs["cu_seqlens_q_output"],
+            share_inputs["reasoning_status"],
+            share_inputs["max_dec_len"],
+            share_inputs["step_idx"],
+            max_model_len,
+            self.speculative_verify_window,
+            self.verify_strategy.value,
+            final_reject_all,
+            final_accept_all,
+        )
+        return SamplerOutput(
+            sampled_token_ids=share_inputs["accept_tokens"],
+            logprobs_tensors=None,
+            token_num_per_batch=share_inputs["accept_num"],
+            logits=logits,
+        )
 
     def forward_xpu(
         self,
@@ -1039,8 +1295,7 @@ class SpeculativeSampler(nn.Layer):
         share_inputs: List[paddle.Tensor],
         accept_all_drafts: bool = False,
         reject_all_drafts: bool = False,
-    ) -> paddle.Tensor:
-        from fastdeploy.model_executor.ops.xpu import speculate_verify, top_p_candidates
+    ) -> SamplerOutput:
 
         logits = apply_speculative_penalty_multi_scores(
             sampling_metadata.token_ids_all,
@@ -1056,67 +1311,44 @@ class SpeculativeSampler(nn.Layer):
             sampling_metadata.min_dec_lens,
             sampling_metadata.eos_token_ids,
             share_inputs["seq_lens_this_time"],
-            share_inputs["output_padding_offset"],
-            share_inputs["output_cum_offsets"],
+            share_inputs["batch_id_per_token_output"],
+            share_inputs["cu_seqlens_q_output"],
             max_model_len,
-            sampling_metadata.pre_token_ids,
         )
+
+        if self.enf_gen_phase_tag:
+            reasoning_phase_token_constraint(
+                logits,
+                sampling_metadata.token_ids_all,
+                sampling_metadata.prompt_lens,
+                share_inputs["stop_flags"],
+                share_inputs["seq_lens_this_time"],
+                share_inputs["seq_lens_encoder"],
+                share_inputs["step_idx"],
+                share_inputs["reasoning_allowed_tokens"],
+                share_inputs["reasoning_status"],
+                share_inputs["batch_id_per_token_output"],
+                share_inputs["cu_seqlens_q_output"],
+                share_inputs["enable_thinking"],
+                self.think_end_id,
+                self.line_break_id,
+            )
 
         probs = F.softmax(logits)
 
-        top_p, top_k, topp_seed = padding_sampling_params(
-            sampling_metadata.top_p,
-            sampling_metadata.top_k,
-            sampling_metadata.seed,
-            paddle.reshape(share_inputs["seq_lens_this_time"], shape=[-1]),
-            paddle.reshape(share_inputs["seq_lens_encoder"], shape=[-1]),
-        )
-        _, sampled_token_ids = top_k_top_p_sampling(probs, top_p=top_p, top_k=top_k, topp_seed=topp_seed)
-
-        verify_scores, verify_tokens, actual_candidate_len = top_p_candidates(
-            probs,
-            sampling_metadata.top_p,
-            share_inputs["output_padding_offset"],
-            self.speculative_max_candidate_len,
-            max_model_len,
-        )
-
-        speculate_verify(
-            sampled_token_ids,
-            share_inputs["accept_tokens"],
-            share_inputs["accept_num"],
-            share_inputs["step_idx"],
-            share_inputs["stop_flags"],
-            share_inputs["seq_lens_encoder"],
-            share_inputs["seq_lens_decoder"],
-            share_inputs[
-                "draft_tokens"
-            ],  # Both input and output, need to write the last 1 token accepted to position 0.
-            share_inputs["seq_lens_this_time"],
-            verify_tokens,
-            verify_scores,
-            share_inputs["max_dec_len"],
-            sampling_metadata.eos_token_ids,
-            share_inputs["is_block_step"],
-            share_inputs["output_cum_offsets"],
-            actual_candidate_len,
-            share_inputs["actual_draft_token_num"],
-            sampling_metadata.top_p,
-            max_model_len,
-            self.speculative_verify_window,
-            True,  # enable_topp
-            (self.speculative_benchmark_mode or reject_all_drafts),
-            accept_all_drafts,
-        )
-        # TODO(chenhuan09): support return logprobs
-        token_ids = share_inputs["accept_tokens"]
-        sampler_output = SamplerOutput(
-            sampled_token_ids=token_ids,
-            logprobs_tensors=None,
-            token_num_per_batch=share_inputs["accept_num"],
-            cu_batch_token_offset=None,
-        )
-        return sampler_output
+        is_naive = self.spec_method is None or self.spec_method == SpecMethod.NAIVE
+        if is_naive:
+            return self._normal_sample_xpu(logits, probs, sampling_metadata, share_inputs)
+        else:
+            return self._verify_and_sample_xpu(
+                logits,
+                probs,
+                sampling_metadata,
+                max_model_len,
+                share_inputs,
+                accept_all_drafts,
+                reject_all_drafts,
+            )
 
 
 class MTPSampler(nn.Layer):
@@ -1254,7 +1486,18 @@ class MTPSampler(nn.Layer):
             indices = token_ids
             top_logprobs = token_logprobs
 
-        return LogprobsTensors(indices, top_logprobs, token_ranks)
+        if current_platform.is_cuda():
+            indices_cpu = paddle.empty_like(indices, device="cpu").pin_memory()
+            top_logprobs_cpu = paddle.empty_like(top_logprobs, device="cpu").pin_memory()
+            token_ranks_cpu = paddle.empty_like(token_ranks, device="cpu").pin_memory()
+            indices_cpu.copy_(indices, False)
+            top_logprobs_cpu.copy_(top_logprobs, False)
+            token_ranks_cpu.copy_(token_ranks, False)
+        else:
+            indices_cpu = indices.cpu()
+            top_logprobs_cpu = top_logprobs.cpu()
+            token_ranks_cpu = token_ranks.cpu()
+        return LogprobsTensors(indices_cpu, top_logprobs_cpu, token_ranks_cpu)
 
     def forward_cuda(
         self,
@@ -1275,35 +1518,7 @@ class MTPSampler(nn.Layer):
             elif self.logprobs_mode == "raw_logits":
                 raw_logprobs = share_inputs["draft_logits"][:real_token_num, :].clone()
 
-        if sampling_metadata.token_ids_all is not None:
-            token_ids_all = sampling_metadata.token_ids_all
-            prompt_lens = sampling_metadata.prompt_lens
-        else:
-            token_ids_all = sampling_metadata.pre_token_ids
-            prompt_lens = sampling_metadata.fake_prompt_lens
-
-        logits = apply_speculative_penalty_multi_scores(
-            token_ids_all,
-            prompt_lens,
-            logits,
-            sampling_metadata.repetition_penalties,
-            sampling_metadata.frequency_penalties,
-            sampling_metadata.presence_penalties,
-            sampling_metadata.temperature,
-            sampling_metadata.bad_words_token_ids,
-            sampling_metadata.bad_words_token_len,
-            sampling_metadata.step_idx,
-            sampling_metadata.min_dec_lens,
-            sampling_metadata.eos_token_ids,
-            share_inputs["seq_lens_this_time"],
-            share_inputs["batch_id_per_token_output"],
-            share_inputs["cu_seqlens_q_output"],
-            max_model_len,
-            sampling_metadata.pre_token_ids,
-        )
-        probs = F.softmax(logits)
-
-        next_tokens = paddle.argmax(probs, axis=-1)
+        next_tokens = paddle.argmax(logits, axis=-1)
 
         token_ids = None
         logprobs_tensors = None
@@ -1351,10 +1566,9 @@ class MTPSampler(nn.Layer):
             sampling_metadata.min_dec_lens,
             sampling_metadata.eos_token_ids,
             share_inputs["seq_lens_this_time"],
-            share_inputs["output_padding_offset"],
-            share_inputs["output_cum_offsets"],
+            share_inputs["batch_id_per_token_output"],
+            share_inputs["cu_seqlens_q_output"],
             max_model_len,
-            sampling_metadata.pre_token_ids,
         )
         probs = F.softmax(logits)
         next_tokens = paddle.argmax(probs, axis=-1)

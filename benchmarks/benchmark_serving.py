@@ -39,7 +39,13 @@ from backend_request_func import (
     RequestFuncInput,
     RequestFuncOutput,
 )
-from benchmark_dataset import EBChatDataset, EBDataset, RandomTextDataset, SampleRequest
+from benchmark_dataset import (
+    EBChatDataset,
+    EBDataset,
+    RandomTextDataset,
+    RandomTokenDataset,
+    SampleRequest,
+)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from tqdm.asyncio import tqdm
 
@@ -208,24 +214,27 @@ def calculate_metrics(
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
             itls += outputs[i].itl
-            # 推理侧ITL
-            s_a = outputs[i].arrival_time[1:]
-            for j in range(len(s_a) - 2):
-                s_itls.append(s_a[j + 1] - s_a[j])
             ttfts.append(outputs[i].ttft)
-            # 推理侧TTFT
-            s_ttfts.append(outputs[i].arrival_time[1])
             res_ttfts.append(outputs[i].res_ttft)
             e2els.append(outputs[i].latency)
-            # 推理侧整句时延
-            s_e2els.append(outputs[i].arrival_time[-1])
-            # 解码速度去掉首token
-            if len(outputs[i].arrival_time) > 2:
-                s_decodes.append(
-                    (outputs[i].output_tokens - 1) / (outputs[i].arrival_time[-1] - outputs[i].arrival_time[1])
-                )
-            else:
-                print("len(outputs[i].arrival_time) <= 2")
+            # 推理侧指标，仅stream模式有效
+            if len(outputs[i].arrival_time) > 1:
+                # 推理侧ITL
+                s_a = outputs[i].arrival_time[1:]
+
+                for j in range(len(s_a) - 2):
+                    s_itls.append(s_a[j + 1] - s_a[j])
+                # 推理侧TTFT
+                s_ttfts.append(outputs[i].arrival_time[1])
+                # 推理侧整句时延
+                s_e2els.append(outputs[i].arrival_time[-1])
+                # 解码速度去掉首token
+                if len(outputs[i].arrival_time) > 2:
+                    s_decodes.append(
+                        (outputs[i].output_tokens - 1) / (outputs[i].arrival_time[-1] - outputs[i].arrival_time[1])
+                    )
+                else:
+                    print("len(outputs[i].arrival_time) <= 2")
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -352,6 +361,8 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
+    if not args.stream:
+        print("使用非流式请求")
     test_prompt, test_output_len, test_no, test_json_data = (
         input_requests[0].prompt,
         input_requests[0].expected_output_len,
@@ -383,23 +394,27 @@ async def benchmark(
         response_format=response_format,
         random_flag=random_flag,
         json_data=test_json_data,
+        tokenizer_model=args.tokenizer_model,
+        tokenizer_path=args.tokenizer_path,
+        stream=args.stream,
     )
 
-    print("test_input:", test_input)
+    if not debug:
+        print("test_input:", test_input)
 
-    test_output = await request_func(request_func_input=test_input)
+        test_output = await request_func(request_func_input=test_input)
 
-    if args.multi_turn:
-        out_list, metrics = test_output
-        test_output = out_list[0]
+        if args.multi_turn:
+            out_list, metrics = test_output
+            test_output = out_list[0]
 
-    if not test_output.success:
-        print("test_output:", test_output, flush=True)
-        raise ValueError(
-            f"Initial test run failed - Please make sure that 1. benchmark arguments are correctly specified and 2. the http_proxy and https_proxy are turned off. Error: {test_output.error}"
-        )
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+        if not test_output.success:
+            print("test_output:", test_output, flush=True)
+            raise ValueError(
+                f"Initial test run failed - Please make sure that 1. benchmark arguments are correctly specified and 2. the http_proxy and https_proxy are turned off. Error: {test_output.error}"
+            )
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -490,6 +505,9 @@ async def benchmark(
                 response_format=response_format,
                 random_flag=random_flag,
                 json_data=json_data,
+                tokenizer_model=args.tokenizer_model,
+                tokenizer_path=args.tokenizer_path,
+                stream=args.stream,
             )
             tasks.append(asyncio.create_task(limited_request_func(request_func_input=request_func_input, pbar=pbar)))
 
@@ -576,6 +594,9 @@ async def benchmark(
                     response_format=response_format,
                     random_flag=random_flag,
                     json_data=json_data,
+                    tokenizer_model=args.tokenizer_model,
+                    tokenizer_path=args.tokenizer_path,
+                    stream=args.stream,
                 )
 
                 tasks.append(asyncio.create_task(limited_request_func_per_ip(req_input, semaphore, pbar)))
@@ -1110,8 +1131,10 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace, results: dict[str
 def main(args: argparse.Namespace):
     """Main entry point"""
     print(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    if args.seed is not None:
+        print(f"Using random seed: {args.seed}")
+        random.seed(args.seed)
+        np.random.seed(args.seed)
 
     backend = args.backend
     # 支持多轮对话方式请求，仅支持chat接口
@@ -1144,6 +1167,12 @@ def main(args: argparse.Namespace):
             output_len=args.sharegpt_output_len,
         ),
         "random": lambda: RandomTextDataset().sample(
+            num_requests=args.num_prompts,
+            random_input_len=args.random_input_len,
+            random_output_len=args.random_output_len,
+            random_range_ratio=args.random_range_ratio,
+        ),
+        "random_token_ids": lambda: RandomTokenDataset().sample(
             num_requests=args.num_prompts,
             random_input_len=args.random_input_len,
             random_output_len=args.random_output_len,
@@ -1184,7 +1213,7 @@ def main(args: argparse.Namespace):
     # 超参由yaml传入
     if args.hyperparameter_path:
         with open(args.hyperparameter_path, "r") as f:
-            hyper_parameters = yaml.safe_load(f)
+            hyper_parameters = yaml.safe_load(f) or {}
     else:
         hyper_parameters = {}
 
@@ -1331,6 +1360,7 @@ if __name__ == "__main__":
             "EB",
             "EBChat",
             "random",
+            "random_token_ids",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1411,7 +1441,7 @@ if __name__ == "__main__":
         "bursty requests. A higher burstiness value (burstiness > 1) "
         "results in a more uniform arrival of requests.",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--shuffle",
         action="store_true",
@@ -1426,6 +1456,25 @@ if __name__ == "__main__":
         "--multi-turn",
         action="store_true",
         help="按多轮对话方式请求",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_false",
+        dest="stream",
+        help="关闭流式输出",
+    )
+    parser.set_defaults(stream=True)
+    parser.add_argument(
+        "--tokenizer-model",
+        default="auto",
+        type=str,
+        help="使用token_ids请求时指定，多轮对话tokenizer模型类型，'eb': ErnieBotTokenizer, 'eb5': Ernie5Tokenizer, 'eb_mm': Ernie4_5Tokenizer",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="使用token_ids请求时指定，模型tokenizer路径",
     )
     parser.add_argument(
         "--drop-ratio",

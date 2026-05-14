@@ -21,7 +21,10 @@ import paddle.distributed as dist
 from paddle.distributed import fleet
 
 import fastdeploy.envs as envs
-from fastdeploy.utils import register_custom_python_op
+from fastdeploy.platforms import current_platform
+from fastdeploy.utils import get_logger, register_custom_python_op
+
+logger = get_logger("communication")
 
 # Constants
 SUPPORTED_DTYPES = (paddle.float32, paddle.float16, paddle.bfloat16)
@@ -159,12 +162,21 @@ try:
             return _TP_AR.custom_all_reduce(input_)
 
         if paddle.in_dynamic_mode():
-            if group_ is not None:
-                dist.all_reduce(input_, group=group_)
+            if current_platform.is_iluvatar():
+                # use_calc_stream = False will raise event sync error when enable cuda graph and tp_size > 1
+                if group_ is not None:
+                    stream.all_reduce(input_, op=ReduceOp.SUM, group=group_, sync_op=True, use_calc_stream=True)
+                else:
+                    hcg = fleet.get_hybrid_communicate_group()
+                    mp_group = hcg.get_model_parallel_group()
+                    stream.all_reduce(input_, op=ReduceOp.SUM, group=mp_group, sync_op=True, use_calc_stream=True)
             else:
-                hcg = fleet.get_hybrid_communicate_group()
-                mp_group = hcg.get_model_parallel_group()
-                dist.all_reduce(input_, group=mp_group)
+                if group_ is not None:
+                    dist.all_reduce(input_, group=group_)
+                else:
+                    hcg = fleet.get_hybrid_communicate_group()
+                    mp_group = hcg.get_model_parallel_group()
+                    dist.all_reduce(input_, group=mp_group)
         else:
             dist.all_reduce(input_)
         return input_
@@ -181,8 +193,17 @@ try:
         input_ = _TP_AR.decode_alltoall_transpose(input_, out)
         return input_
 
-except:
-    tensor_model_parallel_all_reduce = None
+except Exception as e:
+    logger.warning(f"Failed to register tensor_model_parallel_all_reduce: {e}")
+
+    _reg_err = e
+
+    def tensor_model_parallel_all_reduce(input_: "paddle.Tensor", group_=None) -> "paddle.Tensor":
+        raise RuntimeError(f"tensor_model_parallel_all_reduce is not available. Registration failed with: {_reg_err}")
+
+    def decode_alltoall_transpose(input_: "paddle.Tensor", out=None) -> "paddle.Tensor":
+        raise RuntimeError(f"decode_alltoall_transpose is not available. Registration failed with: {_reg_err}")
+
 
 from paddle.distributed.communication import stream
 from paddle.distributed.communication.reduce import ReduceOp
@@ -209,5 +230,12 @@ try:
         else:
             dist.all_reduce(input_)
 
-except:
-    tensor_model_parallel_all_reduce_custom = None
+except Exception as e:
+    logger.warning(f"Failed to register tensor_model_parallel_all_reduce_custom: {e}")
+
+    _reg_err2 = e
+
+    def tensor_model_parallel_all_reduce_custom(input_: "paddle.Tensor") -> "paddle.Tensor":
+        raise RuntimeError(
+            f"tensor_model_parallel_all_reduce_custom is not available. Registration failed with: {_reg_err2}"
+        )

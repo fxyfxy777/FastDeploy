@@ -36,6 +36,7 @@ type SchedulerConfig struct {
 	PrefillPolicy        string  `yaml:"prefill-policy"`
 	DecodePolicy         string  `yaml:"decode-policy"`
 	EvictionIntervalSecs float64 `yaml:"eviction-interval-secs"`
+	EvictionDurationMins float64 `yaml:"eviction-duration-mins"`
 	CacheBlockSize       int     `yaml:"cache-block-size"`
 	TokenizerURL         string  `yaml:"tokenizer-url"`
 	TokenizerTimeoutSecs float64 `yaml:"tokenizer-timeout-secs"`
@@ -44,6 +45,7 @@ type SchedulerConfig struct {
 	HitRatioWeight       float64 `yaml:"hit-ratio-weight"`
 	LoadBalanceWeight    float64 `yaml:"load-balance-weight"`
 	WaitingWeight        float64 `yaml:"waiting-weight"`
+	StatsIntervalSecs    float64 `yaml:"stats-interval-secs"`
 }
 
 type LogConfig struct {
@@ -97,6 +99,9 @@ func Load(configPath, listenPort string, isSplitwise bool) (*Config, error) {
 	if cfg.Scheduler.EvictionIntervalSecs == 0 {
 		cfg.Scheduler.EvictionIntervalSecs = 60
 	}
+	if cfg.Scheduler.EvictionDurationMins == 0 {
+		cfg.Scheduler.EvictionDurationMins = 30
+	}
 	if cfg.Scheduler.CacheBlockSize == 0 {
 		cfg.Scheduler.CacheBlockSize = 64
 	}
@@ -126,6 +131,9 @@ func Load(configPath, listenPort string, isSplitwise bool) (*Config, error) {
 	}
 	if cfg.Scheduler.DecodePolicy == "" {
 		cfg.Scheduler.DecodePolicy = "request_num"
+	}
+	if cfg.Scheduler.StatsIntervalSecs == 0 {
+		cfg.Scheduler.StatsIntervalSecs = 5
 	}
 	return &cfg, nil
 }

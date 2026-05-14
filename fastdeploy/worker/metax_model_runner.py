@@ -20,7 +20,7 @@ import queue
 import time
 from concurrent.futures import Future
 from threading import Thread
-from typing import Any, Dict, List, Optional, cast
+from typing import List, Optional, cast
 
 import numpy as np
 import paddle
@@ -33,7 +33,7 @@ from fastdeploy.config import FDConfig
 from fastdeploy.engine.pooling_params import PoolingParams
 from fastdeploy.engine.request import ImagePosition, Request, RequestType
 from fastdeploy.engine.tasks import PoolingTask
-from fastdeploy.input.ernie4_5_vl_processor import DataProcessor
+from fastdeploy.input.image_processors.adaptive_processor import AdaptiveImageProcessor
 from fastdeploy.inter_communicator import IPCSignal, ZmqIpcClient
 from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.model_executor.graph_optimization.utils import (
@@ -97,7 +97,7 @@ class MetaxModelRunner(ModelRunnerBase):
     ):
         super().__init__(fd_config=fd_config, device=device)
         self.MAX_INFER_SEED = 9223372036854775806
-        self.enable_mm = self.model_config.enable_mm
+        self.enable_mm = self.fd_config.enable_mm_runtime
         self.rank = rank
         self.local_rank = local_rank
         self.device_id = device_id
@@ -571,12 +571,12 @@ class MetaxModelRunner(ModelRunnerBase):
                                 image_features_output is not None
                             ), f"image_features_output is None, images_lst length: {len(multi_vision_inputs['images_lst'])}"
                             grid_thw = multi_vision_inputs["grid_thw_lst_batches"][index][thw_idx]
-                            mm_token_lenght = inputs["mm_num_token_func"](grid_thw=grid_thw)
-                            mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
+                            mm_token_length = inputs["mm_num_token_func"](grid_thw=grid_thw)
+                            mm_feature = image_features_output[feature_idx : feature_idx + mm_token_length]
 
                             # add feature to encoder cache
                             self.encoder_cache[mm_hash] = mm_feature.detach().cpu()
-                            feature_idx += mm_token_lenght
+                            feature_idx += mm_token_length
                             thw_idx += 1
 
                         feature_start = feature_position.offset
@@ -596,13 +596,13 @@ class MetaxModelRunner(ModelRunnerBase):
                 merge_image_features, thw_idx = [], 0
                 for feature_position in feature_position_item:
                     grid_thw = grid_thw_lst[thw_idx]
-                    mm_token_lenght = inputs["mm_num_token_func"](grid_thw=grid_thw)
-                    mm_feature = image_features_output[feature_idx : feature_idx + mm_token_lenght]
+                    mm_token_length = inputs["mm_num_token_func"](grid_thw=grid_thw)
+                    mm_feature = image_features_output[feature_idx : feature_idx + mm_token_length]
 
                     feature_start = feature_position.offset
                     feature_end = feature_position.offset + feature_position.length
                     merge_image_features.append(mm_feature[feature_start:feature_end])
-                    feature_idx += mm_token_lenght
+                    feature_idx += mm_token_length
                     thw_idx += 1
                 image_features_list.append(paddle.concat(merge_image_features, axis=0))
             for idx, index in req_idx_img_index_map.items():
@@ -1308,7 +1308,7 @@ class MetaxModelRunner(ModelRunnerBase):
         # Set forward_meta.is_dummy_or_profile_run to True to skip init_kv_signal_per_query for attention backends
         self.forward_meta.is_dummy_or_profile_run = is_dummy_or_profile_run
 
-        # Initialzie attention meta data
+        # Initialize attention meta data
         for attn_backend in self.attn_backends:
             attn_backend.init_attention_metadata(self.forward_meta)
 
@@ -1345,9 +1345,10 @@ class MetaxModelRunner(ModelRunnerBase):
         # Check if gpu runner needs to create kv cache
         # 1. During profiling, it creates its own kv cache.
         # 2. If no need to profile, create kv cache if cache managers do not exist.
+        #    Note: even when CPU cache (num_cpu_blocks > 0) is enabled, GPU runner still
+        #    creates GPU cache tensors; cache transfer manager handles CPU<->GPU swap.
         create_cache_tensor = profile or not (
-            self.fd_config.cache_config.num_cpu_blocks > 0
-            or self.fd_config.cache_config.kvcache_storage_backend
+            self.fd_config.cache_config.kvcache_storage_backend
             or self.fd_config.scheduler_config.splitwise_role != "mixed"
         )
 
@@ -1441,7 +1442,9 @@ class MetaxModelRunner(ModelRunnerBase):
         """
         Initialize attention backends
         """
-        assert len(self.attn_backends) == 0
+        assert (
+            len(self.attn_backends) == 0
+        ), f"attn_backends should be empty before initialization, got {len(self.attn_backends)} backends"
 
         num_heads = self.model_config.num_attention_heads // self.parallel_config.tensor_parallel_size
         self.model_config.kv_num_heads = max(
@@ -1744,19 +1747,16 @@ class MetaxModelRunner(ModelRunnerBase):
             self.forward_meta.step_use_cudagraph = in_capturing and self.forward_meta.step_use_cudagraph
             self.padding_cudagraph_inputs()
 
-            # 3. Run model
+            model_inputs = {}
+            model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
             if self.enable_mm:
-                model_output = self.model(
-                    self.forward_meta.ids_remove_padding,
-                    self.share_inputs["image_features"],
-                    self.forward_meta,
-                )
-            else:
-                # fallback paddleformers use cuda graph need kwargs
-                model_output = self.model(
-                    ids_remove_padding=self.forward_meta.ids_remove_padding,
-                    forward_meta=self.forward_meta,
-                )
+                model_inputs["image_features"] = self.share_inputs["image_features"]
+
+            # 3. Run model
+            model_output = self.model(
+                model_inputs,
+                self.forward_meta,
+            )
             if self.use_cudagraph:
                 model_output = model_output[: self.real_token_num]
 
@@ -2034,18 +2034,16 @@ class MetaxModelRunner(ModelRunnerBase):
         # 2. Padding inputs for cuda graph
         self.padding_cudagraph_inputs()
 
-        # 3. Execute model
+        model_inputs = {}
+        model_inputs["ids_remove_padding"] = self.share_inputs["ids_remove_padding"]
         if self.enable_mm:
-            model_output = self.model(
-                self.forward_meta.ids_remove_padding,
-                self.share_inputs["image_features"],
-                self.forward_meta,
-            )
-        else:
-            model_output = self.model(
-                ids_remove_padding=self.forward_meta.ids_remove_padding,
-                forward_meta=self.forward_meta,
-            )
+            model_inputs["image_features"] = self.share_inputs["image_features"]
+
+        # 3. Run model
+        model_output = self.model(
+            model_inputs,
+            self.forward_meta,
+        )
 
         # NOTE(wufeisheng): If `not_need_stop`` is False, it means the current worker is in an idle state.
         # This logic is not used in TP (Tensor Parallelism) mode. However, in EP (Expert Parallelism) mode,
@@ -2494,8 +2492,7 @@ class MetaxModelRunner(ModelRunnerBase):
     def clear_cache(self, profile=False):
         """Clear cached data from shared inputs and forward metadata"""
         create_cache_tensor = profile or not (
-            self.fd_config.cache_config.num_cpu_blocks > 0
-            or self.fd_config.cache_config.kvcache_storage_backend
+            self.fd_config.cache_config.kvcache_storage_backend
             or self.fd_config.scheduler_config.splitwise_role != "mixed"
         )
         local_rank = self.local_rank % self.parallel_config.tensor_parallel_size
@@ -2514,7 +2511,7 @@ class MetaxModelRunner(ModelRunnerBase):
         """Dynamic model loader use to clear parameters use for RL"""
         # Clear CUDAGraph
         if self.use_cudagraph:
-            self.model.clear_grpah_opt_backend()
+            self.model.clear_graph_opt_backend()
         # Clear parameters and Send single
         self.dynamic_weight_manager.clear_parameters(
             pid, self.fd_config.parallel_config.shutdown_comm_group_if_worker_idle
@@ -2553,8 +2550,8 @@ class MetaxModelRunner(ModelRunnerBase):
 
         self.dynamic_weight_manager._log_memory("dynamic weight manager update all memory")
 
-    def update_weights(self, version: str = None, rsync_config: Dict[str, Any] = None):
-        return self.dynamic_weight_manager.update_weights_by_rdma(version, rsync_config)
+    def update_weights(self, version: str = None, verify_checksum: bool = False):
+        return self.dynamic_weight_manager.update_weights_by_rdma(version, verify_checksum)
 
     def padding_cudagraph_inputs(self) -> None:
         """
@@ -2569,12 +2566,7 @@ class MetaxModelRunner(ModelRunnerBase):
         return
 
     def _init_image_preprocess(self) -> None:
-        processor = DataProcessor(
-            tokenizer_name=self.model_config.model,
-            image_preprocessor_name=str(self.model_config.model),
-        )
-        processor.eval()
-        image_preprocess = processor.image_preprocessor
+        image_preprocess = AdaptiveImageProcessor.from_pretrained(str(self.model_config.model))
         image_preprocess.image_mean_tensor = paddle.to_tensor(image_preprocess.image_mean, dtype="float32").reshape(
             [1, 3, 1, 1]
         )
@@ -2626,7 +2618,7 @@ class MetaxModelRunner(ModelRunnerBase):
 
     def extract_vision_features_ernie(self, vision_inputs: dict[str, list[paddle.Tensor]]) -> paddle.Tensor:
         """
-        vision feature extactor for ernie-vl
+        vision feature extractor for ernie-vl
         """
         assert len(vision_inputs["images_lst"]) > 0, "at least one image needed"
 

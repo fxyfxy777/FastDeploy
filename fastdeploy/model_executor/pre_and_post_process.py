@@ -25,6 +25,7 @@ from fastdeploy.config import SpeculativeConfig
 from fastdeploy.platforms import current_platform
 from fastdeploy.worker.input_batch import (
     InputBatch,
+    ProposerInputBatch,
     recover_batch_index_for_output,
     recover_batch_index_for_sampler_output,
 )
@@ -100,6 +101,8 @@ else:
         limit_thinking_content_length,
         speculate_limit_thinking_content_length,
         custom_numpy_to_tensor,
+        mtp_save_first_token,
+        mtp_save_first_token_with_topk,
     )
 
 from fastdeploy.model_executor.entropy_utils import (
@@ -116,36 +119,33 @@ from fastdeploy.worker.output import LogprobsTensors, ModelOutputData, SamplerOu
 
 DISABLE_RECOVER = envs.FD_DISABLED_RECOVER == "1"
 
-if current_platform.is_cuda():
 
-    def async_set_value(tgt, src):
-        if isinstance(src, (int, float, bool)):
-            src = paddle.full(tgt.shape, fill_value=src, dtype=tgt.dtype)
-        elif isinstance(src, (list, np.array)):
-            dtype_str = str(tgt.dtype).split(".")[1]
-            if isinstance(src, list):
-                src = np.array(src, dtype=dtype_str if dtype_str != "bfloat16" else "float32")
+def async_set_value(tgt, src):
+    if isinstance(src, (int, float, bool)):
+        src = paddle.full(tgt.shape, fill_value=src, dtype=tgt.dtype)
+    elif isinstance(src, (list, np.ndarray)):
+        dtype_str = str(tgt.dtype).split(".")[1]
+        if isinstance(src, list):
+            src = np.array(src, dtype=dtype_str if dtype_str != "bfloat16" else "float32")
+        if current_platform.is_cuda():
             if str(src.dtype) != dtype_str:
                 srt_tensor = paddle.empty(tgt.shape, dtype=str(src.dtype))
                 src = custom_numpy_to_tensor(src, srt_tensor)
             else:
                 return custom_numpy_to_tensor(src, tgt)
-        elif isinstance(src, paddle.Tensor):
-            pass
         else:
-            raise ValueError("async_set_value unsupported src type: {}".format(type(src)))
-        if src.shape != tgt.shape:
-            src = src.reshape(tgt.shape)
-        if src.dtype != tgt.dtype:
-            src = src.cast(tgt.dtype)
-        if src.place != tgt.place:
-            src = src.to(tgt.place)
-        tgt.copy_(src, blocking=False)
-
-else:
-
-    def async_set_value(*args, **kwargs):
-        raise RuntimeError("async_set_value is only available on CUDA")
+            src = paddle.to_tensor(src, dtype=tgt.dtype)
+    elif isinstance(src, paddle.Tensor):
+        pass
+    else:
+        raise ValueError("async_set_value unsupported src type: {}".format(type(src)))
+    if src.shape != tgt.shape:
+        src = src.reshape(tgt.shape)
+    if src.dtype != tgt.dtype:
+        src = src.cast(tgt.dtype)
+    if src.place != tgt.place:
+        src = src.to(tgt.place)
+    tgt.copy_(src, blocking=False)
 
 
 def pre_process(
@@ -176,7 +176,7 @@ def pre_process(
     if specific_platform and not speculative_decoding:
         # Note(ZKK): This case's code is very simple!
         ids_remove_padding, batch_id_per_token, cu_seqlens_q, cu_seqlens_k = get_padding_offset(
-            input_ids, seq_lens_this_time, None, None, token_num_cpu
+            input_ids, seq_lens_this_time, seq_lens_encoder, seq_lens_decoder, None, token_num_cpu
         )
         return (
             ids_remove_padding,
@@ -432,18 +432,14 @@ def save_output_normal(
     share_inputs["last_preempted_idx"][:] = 0
 
 
-def post_process_specualate(
+def post_process_speculate(
     sampler_output: SamplerOutput,
     model_output: ModelOutputData,
     share_inputs: InputBatch,
     sampling_metadata: SamplingMetadata,
-    save_each_rank: bool = False,
-    skip_save_output: bool = False,
     think_end_id: int = -1,
     splitwise_role_is_decode: bool = False,
     enable_entropy: bool = False,
-    is_naive_mode: bool = False,
-    prefill_one_step_stop: bool = False,
     routing_replay_manager: RoutingReplayManager = None,
 ):
     if think_end_id > 0:
@@ -502,49 +498,124 @@ def post_process_specualate(
         )
 
     # Unified state update: merges speculate_update + speculate_set_value_by_flags_and_idx
-    # into a single kernel launch. For MTP/ngram paths, verify_draft_tokens has already
-    # handled EOS/max_dec_len detection (replacing tokens + updating step_idx), so
-    # unified_update_model_status acts as a no-op for those checks. For naive mode
-    # (which skips verify), this kernel handles EOS/max_dec_len detection.
+    # into a single kernel launch. Handles EOS detection, max_dec_len truncation, step_idx
+    # advancement, token_ids_all history write, and stop_flags/not_need_stop update for all
+    # paths (MTP, ngram, naive). Note: verify_draft_tokens intentionally does NOT write back
+    # step_idx (it is read-only in that kernel); step_idx is always updated here.
+
     unified_update_model_status(
         model_output.seq_lens_encoder,  # seq_lens_encoder
         model_output.seq_lens_decoder,  # seq_lens_decoder
-        model_output.not_need_stop,  # has_running_seqs
+        model_output.not_need_stop_device,  # has_running_seqs
         model_output.draft_tokens,  # step_input_ids
-        model_output.actual_draft_token_num,  # adaptive_step_input_len
         model_output.accept_tokens,  # step_output_ids (read-write)
         model_output.accept_num,  # step_output_len (read-write)
         model_output.stop_flags,  # stop_flags (read-write)
         model_output.seq_lens_this_time,  # seq_lens_this_time
         model_output.is_block_step,  # is_paused
-        model_output.mask_rollback,  # mask_rollback
         model_output.token_ids_all,  # token_ids_all
         model_output.prompt_lens,  # prompt_lens
         model_output.step_idx,  # step_idx (read-write)
         model_output.eos_token_id,  # end_tokens
         model_output.max_dec_len,  # max_dec_len
-        is_naive_mode,  # is_naive_mode
-        prefill_one_step_stop,  # prefill_one_step_stop
     )
 
-    if not skip_save_output:
+
+def save_output_speculate(
+    sampler_output: SamplerOutput,
+    model_output: ModelOutputData,
+    share_inputs: InputBatch,
+    local_rank: int,
+    tensor_parallel_rank: int,
+    save_each_rank: bool = False,
+    is_mtp_prefill: bool = False,
+    proposer_share_inputs: Optional[ProposerInputBatch] = None,
+):
+    if is_mtp_prefill:
+        assert proposer_share_inputs is not None
+        if tensor_parallel_rank == 0:
+            skip_chunk_prefill = bool(int(envs.ENABLE_V1_KVCACHE_SCHEDULER))
+            if sampler_output.logprobs_tensors is None:
+                recover_proposer_share_inputs_map = recover_batch_index_for_output(
+                    proposer_share_inputs,
+                    proposer_share_inputs.index_to_batch_id,
+                    proposer_share_inputs.enable_pd_reorder,
+                    [
+                        "base_model_draft_tokens",
+                        "seq_lens_decoder",
+                        "prompt_lens",
+                        "step_idx",
+                    ],
+                )
+                mtp_save_first_token(
+                    recover_proposer_share_inputs_map["base_model_draft_tokens"],
+                    proposer_share_inputs["not_need_stop"],
+                    recover_proposer_share_inputs_map["seq_lens_decoder"],
+                    recover_proposer_share_inputs_map["prompt_lens"],
+                    recover_proposer_share_inputs_map["step_idx"],
+                    local_rank,
+                    save_each_rank,
+                    skip_chunk_prefill,
+                )
+            else:
+                recover_share_inputs_map = recover_batch_index_for_output(
+                    share_inputs,
+                    model_output.index_to_batch_id,
+                    model_output.enable_pd_reorder,
+                    [
+                        "sampled_token_ids",
+                        "accept_tokens_cpu",
+                        "accept_num_cpu",
+                        "seq_lens_decoder_cpu",
+                        "prompt_lens_cpu",
+                        "last_preempted_idx",
+                    ],
+                )
+                recover_batch_index_for_sampler_output(
+                    sampler_output, model_output.index_to_batch_id, model_output.enable_pd_reorder
+                )
+                recover_proposer_share_inputs_map = recover_batch_index_for_output(
+                    proposer_share_inputs,
+                    proposer_share_inputs.index_to_batch_id,
+                    proposer_share_inputs.enable_pd_reorder,
+                    ["base_model_draft_tokens"],
+                )
+                mtp_save_first_token_with_topk(
+                    recover_proposer_share_inputs_map["base_model_draft_tokens"],
+                    sampler_output.logprobs_tensors.logprob_token_ids,
+                    sampler_output.logprobs_tensors.logprobs,
+                    sampler_output.logprobs_tensors.selected_token_ranks,
+                    recover_share_inputs_map["accept_num_cpu"],
+                    sampler_output.cu_batch_token_offset,
+                    model_output.not_need_stop,
+                    recover_share_inputs_map["seq_lens_decoder_cpu"],
+                    recover_share_inputs_map["prompt_lens_cpu"],
+                    recover_share_inputs_map["last_preempted_idx"],
+                    3,  # mtype
+                    model_output.mp_rank,
+                    save_each_rank,
+                )
+    else:
         if sampler_output.logprobs_tensors is None:
-            recover_model_output_map = recover_batch_index_for_output(
-                model_output,
+            recover_share_inputs = recover_batch_index_for_output(
+                share_inputs,
                 model_output.index_to_batch_id,
                 model_output.enable_pd_reorder,
-                ["accept_tokens", "accept_num", "seq_lens_decoder", "prompt_lens"],
-            )
-            recover_share_inputs = recover_batch_index_for_output(
-                share_inputs, model_output.index_to_batch_id, model_output.enable_pd_reorder, ["preempted_idx"]
+                [
+                    "accept_tokens_cpu",
+                    "accept_num_cpu",
+                    "seq_lens_decoder_cpu",
+                    "prompt_lens_cpu",
+                    "last_preempted_idx",
+                ],
             )
             speculate_save_output(
-                recover_model_output_map["accept_tokens"],
-                recover_model_output_map["accept_num"],
+                recover_share_inputs["accept_tokens_cpu"],
+                recover_share_inputs["accept_num_cpu"],
                 model_output.not_need_stop,
-                recover_model_output_map["seq_lens_decoder"],
-                recover_model_output_map["prompt_lens"],
-                recover_share_inputs["preempted_idx"],
+                recover_share_inputs["seq_lens_decoder_cpu"],
+                recover_share_inputs["prompt_lens_cpu"],
+                recover_share_inputs["last_preempted_idx"],
                 model_output.mp_rank,
                 save_each_rank,
                 bool(envs.ENABLE_V1_KVCACHE_SCHEDULER),
@@ -553,30 +624,35 @@ def post_process_specualate(
             recover_batch_index_for_sampler_output(
                 sampler_output, model_output.index_to_batch_id, model_output.enable_pd_reorder
             )
-            recover_model_output_map = recover_batch_index_for_output(
-                model_output,
+            recover_share_inputs = recover_batch_index_for_output(
+                share_inputs,
                 model_output.index_to_batch_id,
                 model_output.enable_pd_reorder,
-                ["seq_lens_decoder", "prompt_lens"],
-            )
-            recover_share_inputs = recover_batch_index_for_output(
-                share_inputs, model_output.index_to_batch_id, model_output.enable_pd_reorder, ["preempted_idx"]
+                [
+                    "sampled_token_ids",
+                    "accept_tokens_cpu",
+                    "accept_num_cpu",
+                    "seq_lens_decoder_cpu",
+                    "prompt_lens_cpu",
+                    "last_preempted_idx",
+                ],
             )
             speculate_save_output_topk(
-                sampler_output.sampled_token_ids,
+                recover_share_inputs["sampled_token_ids"],
                 sampler_output.logprobs_tensors.logprob_token_ids,
                 sampler_output.logprobs_tensors.logprobs,
                 sampler_output.logprobs_tensors.selected_token_ranks,
-                sampler_output.token_num_per_batch,
+                recover_share_inputs["accept_num_cpu"],
                 sampler_output.cu_batch_token_offset,
                 model_output.not_need_stop,
-                recover_model_output_map["seq_lens_decoder"],
-                recover_model_output_map["prompt_lens"],
-                recover_share_inputs["preempted_idx"],
+                recover_share_inputs["seq_lens_decoder_cpu"],
+                recover_share_inputs["prompt_lens_cpu"],
+                recover_share_inputs["last_preempted_idx"],
                 3,  # mtype
                 model_output.mp_rank,
                 save_each_rank,
             )
+    share_inputs["last_preempted_idx"][:] = 0
 
 
 def post_process(
@@ -592,8 +668,6 @@ def post_process(
     think_end_id: int = -1,
     splitwise_role_is_decode: bool = False,
     enable_entropy: bool = False,
-    is_naive_mode: bool = False,
-    prefill_one_step_stop: bool = False,
     routing_replay_manager: RoutingReplayManager = None,
 ) -> None:
     """Post-processing steps after completing a single token generation."""
@@ -611,20 +685,17 @@ def post_process(
         )
     else:
         if speculative_decoding:
-            post_process_specualate(
+            post_process_speculate(
                 sampler_or_pooler_output,
                 model_output,
                 share_inputs,
                 sampling_metadata,
-                save_each_rank,
-                skip_save_output,
                 think_end_id,
                 splitwise_role_is_decode,
                 enable_entropy,
-                is_naive_mode,
-                prefill_one_step_stop,
                 routing_replay_manager,
             )
+            share_inputs["last_preempted_idx"].copy_(share_inputs["preempted_idx"])
         else:
             post_process_normal(
                 sampler_or_pooler_output,

@@ -77,13 +77,14 @@ def _reload_api_server(args):
         def get(key, default=None):
             return [] if key == "FD_API_KEY" else default
 
-    fake_envs_mod.TRACES_ENABLE = "false"
+    fake_envs_mod.FD_TRACE = "off"
     fake_envs_mod.FD_SERVICE_NAME = ""
     fake_envs_mod.FD_HOST_NAME = ""
     fake_envs_mod.TRACES_EXPORTER = "console"
     fake_envs_mod.EXPORTER_OTLP_ENDPOINT = ""
     fake_envs_mod.EXPORTER_OTLP_HEADERS = ""
     fake_envs_mod.FD_SUPPORT_MAX_CONNECTIONS = 1024
+    fake_envs_mod.FD_ENABLE_V1_UPDATE_WEIGHTS = 0
     fake_envs_mod.environment_variables = _FakeEnvVars()
 
     # Save original sys.argv and replace with minimal valid args to avoid parse errors
@@ -98,9 +99,8 @@ def _reload_api_server(args):
             patch.dict("sys.modules", {"fastdeploy.envs": fake_envs_mod}),
             patch("fastdeploy.envs", fake_envs_mod),
         ):
-            from fastdeploy.entrypoints.openai import api_server as api_server_mod
-
-            return importlib.reload(api_server_mod)
+            sys.modules.pop("fastdeploy.entrypoints.openai.api_server", None)
+            return importlib.import_module("fastdeploy.entrypoints.openai.api_server")
     finally:
         sys.argv = original_argv
 
@@ -446,7 +446,7 @@ async def test_chat_and_completion_routes():
 async def test_chat_completion_tracing():
     args = _build_args(dynamic_load_weight=False)
     api_server = _reload_api_server(args)
-    api_server.envs.TRACES_ENABLE = "true"
+    api_server.envs.FD_TRACE = "otel"
     api_server.app.state.dynamic_load_weight = False
 
     fake_req = SimpleNamespace(headers={"x-request-id": "1"})
@@ -479,8 +479,8 @@ async def test_chat_completion_tracing():
     assert resp_comp.status_code == 200
     assert getattr(body, "trace_context", None) == "ctx"
 
-    # TRACES_ENABLE=True but req.headers is None/empty (missing branch 379, 415)
-    api_server.envs.TRACES_ENABLE = "true"
+    # FD_TRACE=otel but req.headers is None/empty (missing branch 379, 415)
+    api_server.envs.FD_TRACE = "otel"
     fake_req_no_headers = SimpleNamespace(headers=None)
     body2 = SimpleNamespace(model_dump_json=lambda: "{}", stream=False)
     api_server.app.state.chat_handler = SimpleNamespace(create_chat_completion=AsyncMock(return_value=chat_resp))
@@ -534,6 +534,95 @@ async def test_reward_embedding_and_weights():
     api_server.app.state.dynamic_load_weight = False
     assert api_server.update_model_weight(MagicMock()).status_code == 404
     assert api_server.clear_load_weight(MagicMock()).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sleep_wakeup_and_v1_clear_load_weight_routes():
+    args = _build_args(dynamic_load_weight=True)
+    api_server = _reload_api_server(args)
+    api_server.app.state.dynamic_load_weight = True
+    api_server.app.state.event_loop = asyncio.get_running_loop()
+
+    mock_control_response = MagicMock()
+    mock_control_response.to_api_json_response.return_value = api_server.JSONResponse(
+        content={"ok": True}, status_code=200
+    )
+
+    api_server.app.state.engine_client = MagicMock()
+    api_server.app.state.engine_client.run_control_method = AsyncMock(return_value=mock_control_response)
+    api_server.app.state.engine_client.run_control_method_sync.return_value = mock_control_response
+
+    sleep_req = MagicMock()
+    sleep_req.body = AsyncMock(return_value=b'{"tags":"weight"}')
+    sleep_req.json = AsyncMock(return_value={"tags": "weight"})
+    sleep_resp = await api_server.sleep(sleep_req)
+    assert sleep_resp.status_code == 200
+    sleep_control_request = api_server.app.state.engine_client.run_control_method.await_args_list[0].args[0]
+    assert sleep_control_request.method == "sleep"
+    assert sleep_control_request.args == {"tags": "weight"}
+
+    wakeup_req = MagicMock()
+    wakeup_req.body = AsyncMock(return_value=b'{"tags":"weight,kv_cache"}')
+    wakeup_req.json = AsyncMock(return_value={"tags": "weight,kv_cache"})
+    wakeup_resp = await api_server.wakeup(wakeup_req)
+    assert wakeup_resp.status_code == 200
+    wakeup_control_request = api_server.app.state.engine_client.run_control_method.await_args_list[1].args[0]
+    assert wakeup_control_request.method == "wakeup"
+    assert wakeup_control_request.args == {"tags": "weight,kv_cache"}
+
+    passthrough_req = MagicMock()
+    passthrough_req.body = AsyncMock(return_value=b'{"tags":["weight"]}')
+    passthrough_req.json = AsyncMock(return_value={"tags": ["weight"]})
+    passthrough_resp = await api_server.sleep(passthrough_req)
+    assert passthrough_resp.status_code == 200
+    passthrough_control_request = api_server.app.state.engine_client.run_control_method.await_args_list[2].args[0]
+    assert passthrough_control_request.args == {"tags": ["weight"]}
+
+    with patch.object(api_server.envs, "FD_ENABLE_V1_UPDATE_WEIGHTS", True):
+        clear_resp = api_server.clear_load_weight(MagicMock())
+    assert clear_resp.status_code == 200
+    sync_control_request = api_server.app.state.engine_client.run_control_method_sync.call_args.args[0]
+    assert sync_control_request.method == "sleep"
+
+    api_server.app.state.engine_client.run_control_method_sync.reset_mock()
+    with patch.object(api_server.envs, "FD_ENABLE_V1_UPDATE_WEIGHTS", True):
+        update_resp = api_server.update_model_weight(MagicMock())
+    assert update_resp.status_code == 200
+    sync_control_request = api_server.app.state.engine_client.run_control_method_sync.call_args.args[0]
+    assert sync_control_request.method == "wakeup"
+
+
+@pytest.mark.asyncio
+async def test_update_weights_route_validation():
+    args = _build_args(dynamic_load_weight=True)
+    api_server = _reload_api_server(args)
+    mock_control_response = MagicMock()
+    mock_control_response.to_api_json_response.return_value = api_server.JSONResponse(
+        content={"ok": True}, status_code=200
+    )
+    api_server.app.state.engine_client = MagicMock()
+    api_server.app.state.engine_client.run_control_method = AsyncMock(return_value=mock_control_response)
+
+    valid_req = MagicMock()
+    valid_req.body = AsyncMock(return_value=b'{"version":"v2","verify_checksum":true}')
+    valid_req.json = AsyncMock(return_value={"version": "v2", "verify_checksum": True})
+    valid_resp = await api_server.update_weights(valid_req)
+    assert valid_resp.status_code == 200
+    control_request = api_server.app.state.engine_client.run_control_method.await_args.args[0]
+    assert control_request.method == "update_weights"
+    assert control_request.args == {"version": "v2", "verify_checksum": True}
+
+    invalid_version_req = MagicMock()
+    invalid_version_req.body = AsyncMock(return_value=b'{"version":1}')
+    invalid_version_req.json = AsyncMock(return_value={"version": 1})
+    invalid_version_resp = await api_server.update_weights(invalid_version_req)
+    assert invalid_version_resp.status_code == 400
+
+    invalid_checksum_req = MagicMock()
+    invalid_checksum_req.body = AsyncMock(return_value=b'{"verify_checksum":"true"}')
+    invalid_checksum_req.json = AsyncMock(return_value={"verify_checksum": "true"})
+    invalid_checksum_resp = await api_server.update_weights(invalid_checksum_req)
+    assert invalid_checksum_resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -720,3 +809,80 @@ def test_config_info():
         api_server = _reload_api_server(args)
         api_server.llm_engine = None
     assert api_server.config_info().status_code == 500
+
+
+# ── /v1/abort_requests ──────────────────────────────────────────────
+
+
+def _mock_abort_control_response(api_server, result, status_code=200):
+    mock_resp = MagicMock()
+    mock_resp.to_api_json_response.return_value = api_server.JSONResponse(
+        content={"request_id": "control-test", "status": "success", "error_message": None, "result": result},
+        status_code=status_code,
+    )
+    api_server.app.state.engine_client = MagicMock()
+    api_server.app.state.engine_client.run_control_method = AsyncMock(return_value=mock_resp)
+
+
+@pytest.mark.asyncio
+async def test_abort_requests_with_req_ids():
+    args = _build_args()
+    api_server = _reload_api_server(args)
+    _mock_abort_control_response(
+        api_server,
+        {
+            "aborted": [{"request_id": "req-1_0", "output_token_count": 10}],
+            "not_found": ["req-999"],
+        },
+    )
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"req_ids": ["req-1", "req-999"]})
+    resp = await api_server.abort_requests(req)
+    assert resp.status_code == 200
+    control_req = api_server.app.state.engine_client.run_control_method.await_args.args[0]
+    assert control_req.method == "abort_requests"
+    assert control_req.args["req_ids"] == ["req-1", "req-999"]
+    assert control_req.args["abort_all"] is False
+
+
+@pytest.mark.asyncio
+async def test_abort_requests_with_abort_all():
+    args = _build_args()
+    api_server = _reload_api_server(args)
+    _mock_abort_control_response(
+        api_server,
+        {
+            "aborted": [
+                {"request_id": "req-1_0", "output_token_count": 5},
+                {"request_id": "req-2_0", "output_token_count": 12},
+            ],
+            "not_found": [],
+        },
+    )
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"abort_all": True})
+    resp = await api_server.abort_requests(req)
+    assert resp.status_code == 200
+    control_req = api_server.app.state.engine_client.run_control_method.await_args.args[0]
+    assert control_req.args["abort_all"] is True
+    assert control_req.args["req_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_abort_requests_missing_params():
+    args = _build_args()
+    api_server = _reload_api_server(args)
+    req = MagicMock()
+    req.json = AsyncMock(return_value={})
+    resp = await api_server.abort_requests(req)
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_abort_requests_empty_req_ids():
+    args = _build_args()
+    api_server = _reload_api_server(args)
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"req_ids": []})
+    resp = await api_server.abort_requests(req)
+    assert resp.status_code == 400

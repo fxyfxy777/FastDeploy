@@ -16,14 +16,14 @@ modinfo iluvatar |grep description
 Pull the Docker image
 
 ```bash
-docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260312
+docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
 ```
 
 ## 3. 准备容器
 ### 3.1 启动容器
 
 ```bash
-docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260312
+docker run -itd --name paddle_infer --network host -v /usr/src:/usr/src -v /lib/modules:/lib/modules -v /dev:/dev -v /home/paddle:/home/paddle -v /usr/local/corex/bin/ixsmi:/usr/local/corex/bin/ixsmi -v /usr/local/corex/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1 -v /usr/local/corex/lib64/libixml.so:/usr/local/corex/lib64/libixml.so -v /usr/local/corex/lib64/libixthunk.so:/usr/local/corex/lib64/libixthunk.so --privileged --cap-add=ALL --pid=host ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:3.3.0-20260507
 docker exec -it paddle_infer bash
 ```
 
@@ -34,18 +34,24 @@ docker exec -it paddle_infer bash
 ### 3.2 安装paddle
 
 ```bash
-pip3 install paddlepaddle==3.4.0.dev20260226 -i https://www.paddlepaddle.org.cn/packages/nightly/cpu/
-pip3 install paddle-iluvatar-gpu==3.0.0.dev20260226 -i https://www.paddlepaddle.org.cn/packages/nightly/ixuca/
+pip3 install paddlepaddle-iluvatar==3.4.0.dev20260415 -i https://www.paddlepaddle.org.cn/packages/nightly/ixuca/ --extra-index-url https://mirrors.aliyun.com/pypi/simple/
 ```
 
 ### 3.3 安装fastdeploy
+
+以下两种方式安装均可以：
+
+- pip安装
 ```bash
-pip3 install fastdeploy_iluvatar_gpu==2.5.0.dev0 -i https://www.paddlepaddle.org.cn/packages/stable/ixuca/ --extra-index-url https://mirrors.aliyun.com/pypi/simple/
+pip3 install fastdeploy_iluvatar_gpu==2.6.0.dev0 -i https://www.paddlepaddle.org.cn/packages/stable/ixuca/ --extra-index-url https://mirrors.aliyun.com/pypi/simple/
 ```
-可以按如下步骤编译FastDeploy，，得到```最新版本```。
+
+- 源码编译
+可以按如下步骤编译FastDeploy得到```最新版本```。
 ```bash
-git clone https://github.com/PaddlePaddle/FastDeploy
+git clone --recursive https://github.com/PaddlePaddle/FastDeploy.git
 cd FastDeploy
+pip3 install -r requirements_iluvatar.txt -i https://mirrors.aliyun.com/pypi/simple/
 bash build.sh
 ```
 
@@ -59,7 +65,6 @@ bash build.sh
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 run_demo.py
@@ -136,7 +141,6 @@ The largest ocean is  the Pacific Ocean, covering an area of approximately â¦ 
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 -m fastdeploy.entrypoints.openai.api_server \
@@ -193,7 +197,6 @@ Latency: 1539.625 s
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 -m fastdeploy.entrypoints.openai.api_server \
@@ -230,7 +233,6 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 -m fastdeploy.entrypoints.openai.api_server \
@@ -285,7 +287,6 @@ python3 -u bench_gsm8k.py --port 8180 --num-questions 1319 --num-shots 5 --paral
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 run_demo_vl.py
@@ -336,7 +337,7 @@ for message in messages:
             })
 
 sampling_params = SamplingParams(temperature=0.1, max_tokens=6400)
-graph_optimization_config = {"use_cudagraph": False}
+graph_optimization_config = {"use_cudagraph": True}
 llm = LLM(model=PATH, tensor_parallel_size=2, max_model_len=32768, block_size=16, quantization="wint8", limit_mm_per_prompt={"image": 100}, reasoning_parser="ernie-45-vl", graph_optimization_config=graph_optimization_config)
 outputs = llm.generate(prompts={
     "prompt": prompt,
@@ -384,7 +385,6 @@ generated_text=
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 -m fastdeploy.entrypoints.openai.api_server \
@@ -397,7 +397,7 @@ python3 -m fastdeploy.entrypoints.openai.api_server \
        --reasoning-parser ernie-45-vl \
        --max-num-seqs 8 \
        --block-size 16 \
-       --graph-optimization-config '{"use_cudagraph": false}'
+       --graph-optimization-config '{"use_cudagraph": true}'
 ```
 
 客户端:
@@ -424,7 +424,6 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 python3 -m fastdeploy.entrypoints.openai.api_server \
@@ -439,7 +438,7 @@ python3 -m fastdeploy.entrypoints.openai.api_server \
        --mm-processor-kwargs '{"image_max_pixels": 12845056 }' \
        --max-num-seqs 8 \
        --block-size 16 \
-       --graph-optimization-config '{"use_cudagraph": false}'
+       --graph-optimization-config '{"use_cudagraph": true}'
 ```
 
 客户端:
@@ -459,9 +458,9 @@ curl -X POST "http://0.0.0.0:8180/v1/chat/completions" \
 ### 4.3 PaddleOCR-VL系列
 #### 4.3.1 PaddleOCR-VL-0.9B
 
-- (可选) 安装 paddleocr
+- (可选) 源码编译安装 paddleocr
 
-如果想要安装最新的`paddleocr`，可以源码编译。镜像里是基于`39128c2c7fd40be44d8f33498cabd4ec10f1bfcd`源码编译安装的
+如果想要安装最新的`paddleocr`，可以源码编译。镜像里的版本是`3.3.2`
 
 ```bash
 git clone -b main https://github.com/PaddlePaddle/PaddleOCR.git
@@ -475,7 +474,6 @@ pip3 install -e ".[doc-parser]"
 ```bash
 #!/bin/bash
 export PADDLE_XCCL_BACKEND=iluvatar_gpu
-export INFERENCE_MSG_QUEUE_ID=232132
 export LD_PRELOAD=/usr/local/corex/lib64/libcuda.so.1
 export FD_SAMPLING_CLASS=rejection
 export CUDA_VISIBLE_DEVICES=1
@@ -495,7 +493,7 @@ python3 -m fastdeploy.entrypoints.openai.api_server \
 
 客户端:
 ```bash
-paddleocr doc_parser -i https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png --vl_rec_backend fastdeploy-server --vl_rec_server_url http://127.0.0.1:8180/v1
+paddleocr doc_parser -i https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png --vl_rec_backend fastdeploy-server --vl_rec_server_url http://127.0.0.1:8180/v1 --device iluvatar_gpu
 ```
 
 输出如下所示:
@@ -521,7 +519,7 @@ import os
 from paddleocr import PaddleOCRVL
 
 input_path = "./images"
-pipeline = PaddleOCRVL(vl_rec_backend="fastdeploy-server", vl_rec_server_url="http://127.0.0.1:8180/v1")
+pipeline = PaddleOCRVL(vl_rec_backend="fastdeploy-server", vl_rec_server_url="http://127.0.0.1:8180/v1", device="iluvatar_gpu")
 file_list = os.listdir(input_path)
 for file_name in file_list:
     file_path = os.path.join(input_path, file_name)
@@ -538,3 +536,7 @@ python3 infer_ocr_vl_benchmark.py
 ```
 
 每推理完一张图片，会在`output`路径下生成一个对应的`md`文件，跑完整个benchmark（1355张图片）大概需要1.8个小时。
+
+## 5. 支持的量化策略
+- `W8A16`: `--quantization wint8`
+- `W4A16`: `--quantization wint4`

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Dict, List
 from unittest.mock import Mock, patch
 
@@ -24,13 +25,8 @@ import paddle
 import pytest
 import zmq
 
-if not hasattr(paddle, "compat"):
-
-    class _CompatStub:
-        def enable_torch_proxy(self, scope=None):
-            return None
-
-    paddle.compat = _CompatStub()
+if not hasattr(paddle, "enable_compat"):
+    paddle.enable_compat = lambda scope=None: None
 
 from fastdeploy import envs
 from fastdeploy.engine.request import Request, RequestMetrics, RequestOutput
@@ -89,6 +85,10 @@ def _build_connector() -> SplitwiseConnector:
     connector = SplitwiseConnector(cfg=DummyCfg(), worker_queue=DummyWorkerQueue(), resource_manager=None)
     if not hasattr(connector, "push_sockets"):
         connector.push_sockets = {}
+    if not hasattr(connector, "_push_socket_locks"):
+        connector._push_socket_locks = {}
+    if not hasattr(connector, "_push_sockets_meta_lock"):
+        connector._push_sockets_meta_lock = Lock()
     return connector
 
 
@@ -195,6 +195,9 @@ def test_check_decode_allocated_handles_finished_and_error_states():
 def test_send_cache_info_to_prefill_groups_by_addr_and_skips_error():
     connector = _build_connector()
     connector._send_message = Mock()
+    # Add mock resource_manager with waiting_abort_req_id_set
+    connector.resource_manager = Mock()
+    connector.resource_manager.waiting_abort_req_id_set = set()
 
     tasks = [
         DummyTask(
@@ -204,15 +207,6 @@ def test_send_cache_info_to_prefill_groups_by_addr_and_skips_error():
                 "prefill_connector_port": 9001,
                 "block_tables": [1, 2, 3],
             },
-        ),
-        DummyTask(
-            request_id="req-err",
-            disaggregate_info={
-                "prefill_ip": "10.0.0.2",
-                "prefill_connector_port": 9002,
-                "block_tables": [9],
-            },
-            error_msg="failed",
         ),
     ]
 
@@ -251,6 +245,7 @@ def test_init_non_mixed_creates_network_state():
     assert connector.local_data_parallel_id == 1
     assert connector.pull_socket is None
     assert connector.push_sockets == {}
+    assert connector._push_socket_locks == {}
     mock_init.assert_called_once_with()
 
 
@@ -259,9 +254,11 @@ def test_get_push_socket_reuses_existing_and_handles_zmq_error():
     open_socket = Mock()
     open_socket.closed = False
     connector.push_sockets["127.0.0.1:8000"] = open_socket
+    connector._push_socket_locks["127.0.0.1:8000"] = Lock()
 
-    same_socket = connector._get_push_socket("127.0.0.1:8000")
+    same_socket, same_lock = connector._get_push_socket("127.0.0.1:8000")
     assert same_socket is open_socket
+    assert same_lock is connector._push_socket_locks["127.0.0.1:8000"]
 
     connector.zmq_ctx = Mock()
     connector.zmq_ctx.socket.side_effect = zmq.ZMQError("boom")
@@ -276,9 +273,10 @@ def test_get_push_socket_creates_and_configures_socket():
     new_socket.closed = False
     connector.zmq_ctx.socket.return_value = new_socket
 
-    socket = connector._get_push_socket("127.0.0.1:7000")
+    socket, lock = connector._get_push_socket("127.0.0.1:7000")
 
     assert socket is new_socket
+    assert lock is connector._push_socket_locks["127.0.0.1:7000"]
     new_socket.connect.assert_called_once_with("tcp://127.0.0.1:7000")
     assert connector.push_sockets["127.0.0.1:7000"] is new_socket
 
@@ -286,7 +284,8 @@ def test_get_push_socket_creates_and_configures_socket():
 def test_send_message_serializes_and_sends_payload():
     connector = _build_connector()
     mock_socket = Mock()
-    connector._get_push_socket = Mock(return_value=mock_socket)
+    mock_socket.closed = False
+    connector._get_push_socket = Mock(return_value=(mock_socket, Lock()))
     request = Request(
         request_id="req-send",
         prompt=None,
@@ -323,16 +322,20 @@ def test_send_message_handles_missing_addr_and_errors():
     connector._send_message("127.0.0.1:7000", "prefill", [])
 
     failing_socket = Mock()
+    failing_socket.closed = False
     failing_socket.send_multipart.side_effect = zmq.Again()
-    connector._get_push_socket = Mock(return_value=failing_socket)
+    connector._get_push_socket = Mock(return_value=(failing_socket, Lock()))
     connector._send_message("127.0.0.1:7001", "prefill", [])
 
     crash_socket = Mock()
+    crash_socket.closed = False
     crash_socket.send_multipart.side_effect = RuntimeError("boom")
-    connector._get_push_socket = Mock(return_value=crash_socket)
+    connector._get_push_socket = Mock(return_value=(crash_socket, Lock()))
     connector.push_sockets["127.0.0.1:7002"] = crash_socket
+    connector._push_socket_locks["127.0.0.1:7002"] = Lock()
     connector._send_message("127.0.0.1:7002", "prefill", [])
     assert "127.0.0.1:7002" not in connector.push_sockets
+    assert "127.0.0.1:7002" not in connector._push_socket_locks
 
 
 def test_send_splitwise_tasks_updates_roles_and_tracks_ids():
@@ -565,3 +568,17 @@ def test_send_first_token_wraps_task_list():
 
     connector.send_first_token({"decode_ip": "1.2.3.4", "decode_connector_port": 7777}, task)
     connector._send_message.assert_called_once_with("1.2.3.4:7777", "decode", [task])
+
+
+def test_send_message_logs_error_when_serialize_fails():
+    """Test _send_message logs error with traceback when _serialize_message raises exception."""
+    connector = _build_connector()
+    connector.logger = Mock()
+
+    with patch.object(connector, "_serialize_message", side_effect=RuntimeError("serialize error")):
+        connector._send_message("127.0.0.1:8000", "prefill", [])
+
+    connector.logger.error.assert_called_once()
+    error_msg = connector.logger.error.call_args[0][0]
+    assert "Message preparation failed" in error_msg
+    assert "serialize error" in error_msg

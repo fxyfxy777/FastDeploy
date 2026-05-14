@@ -1,5 +1,7 @@
 [English](../../features/disaggregated.md)
 
+[最佳实践](../best_practices/Disaggregated.md)
+
 # 分离式部署
 
 LLM大模型推理分为Prefill和Decode两个阶段，分别为计算密集型和访存密集型。
@@ -25,7 +27,7 @@ LLM大模型推理分为Prefill和Decode两个阶段，分别为计算密集型�
 
 ## PD 分离请求调度
 
-针对PD分离式部署，FastDeploy提供Python版本[Router](https://github.com/PaddlePaddle/FastDeploy/tree/develop/fastdeploy/router)来实现请求收发和请求调度。使用方式和调度流程如下：
+针对PD分离式部署，FastDeploy提供高性能Golang版本[Router](https://github.com/PaddlePaddle/FastDeploy/tree/develop/fastdeploy/golang_router)来实现请求收发和请求调度。使用方式和调度流程如下：
 * 启动Router
 * 启动PD实例，PD实例会注册到Router
 * 用户请求发送到Router
@@ -36,7 +38,7 @@ LLM大模型推理分为Prefill和Decode两个阶段，分别为计算密集型�
 * D实例收到请求和首token后，继续生成后续token，发送给Router
 * Router接收PD实例的生成结果，返回给用户
 
-高性能版本Router正在开发中，敬请期待。
+高性能版本Router现已作为Golang二进制随FastDeploy Python包打包发布，可通过Python命令行直接启动，详见[Router说明文档](../online_serving/router.md)。
 
 ## 使用说明
 
@@ -65,10 +67,10 @@ bash build.sh
 
 **快速上手**
 
-启动Router服务，其中`--splitwise`参数指定为分离式部署的调度方式，日志信息输出在`log_router/router.log`。`fd-router`的安装方法参考[Router说明文档](../online_serving/router.md)。
-```
+启动Router服务，其中`--splitwise`参数指定为分离式部署的调度方式，日志信息输出在`log_router/router.log`。Router使用方式参考[Router说明文档](../online_serving/router.md)。
+```bash
 export FD_LOG_DIR="log_router"
-/usr/local/bin/fd-router \
+python -m fastdeploy.golang_router.launch \
     --port 30000 \
     --splitwise
 ```

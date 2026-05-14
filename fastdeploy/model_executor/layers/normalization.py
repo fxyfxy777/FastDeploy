@@ -35,6 +35,7 @@ from .batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
+from .flashinfer_comm_fusion import flashinfer_allreduce_residual_rmsnorm
 from .utils import get_tensor, modules_to_convert
 
 
@@ -122,6 +123,10 @@ class RMSNorm(nn.Layer):
         self.tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
         self.tp_group = self.fd_config.parallel_config.tp_group
         is_input_norm = prefix.endswith(".input_layernorm")
+        self.enable_all_reduce_fusion = fd_config.parallel_config.enable_flashinfer_allreduce_fusion and (
+            ("post_attention_layernorm" in prefix) or (("input_layernorm" in prefix and layer_id != 0))
+        )
+
         self.is_last_norm = prefix.endswith(".norm")
         self.split_x = (
             self.fd_config.parallel_config.use_sequence_parallel_moe
@@ -240,6 +245,12 @@ class RMSNorm(nn.Layer):
                     norm_out = rms_norm(x, self.weight, self.eps)
                     return norm_out.astype(x_dtype), residual_out
                 norm_out = self.norm_func(x, residual_input, self.weight, self.eps)
+            # enable trtllm all reduce fusion
+            elif self.enable_all_reduce_fusion and x.shape[0] <= 2048:
+                norm_out = flashinfer_allreduce_residual_rmsnorm(
+                    fd_config=self.fd_config, input_tensor=x, residual=residual_input, weight=self.weight, eps=self.eps
+                )
+                assert norm_out[0] is not None, "Trtllm-all-reduce fusion failed!"
             else:
                 if is_batch_invariant_mode_enabled():
                     # M-invariant path: per-row Triton kernel, no cross-row reduction
@@ -339,8 +350,9 @@ class QKRMSNorm(nn.Layer):
         self,
         qkv_out,
         forward_meta,
+        proxy_rmsnorm=None,
     ) -> paddle.Tensor:
-        if self.qk_norm_fused and forward_meta.step_use_cudagraph:
+        if proxy_rmsnorm is None and self.qk_norm_fused:
             qkv_out = qk_rmsnorm_fused(
                 qkv_out,
                 self.q_norm.weight,
@@ -354,11 +366,11 @@ class QKRMSNorm(nn.Layer):
             q, k, v = qkv_out.split([self.q_size, self.kv_size, self.kv_size], axis=-1)
 
             q_by_head = q.reshape([*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim])
-            q_by_head = self.q_norm(q_by_head)[0]
+            q_by_head = self.q_norm(q_by_head, proxy_rmsnorm=proxy_rmsnorm)[0]
             q = q_by_head.reshape(q.shape)
 
             k_by_head = k.reshape([*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim])
-            k_by_head = self.k_norm(k_by_head)[0]
+            k_by_head = self.k_norm(k_by_head, proxy_rmsnorm=proxy_rmsnorm)[0]
             k = k_by_head.reshape(k.shape)
 
             qkv_out = paddle.concat([q, k, v], axis=-1)

@@ -210,6 +210,7 @@ class Ernie4_5_MoE(nn.Layer):
 
         self.experts = FusedMoE(
             fd_config=fd_config,
+            hidden_size=fd_config.model_config.hidden_size,
             moe_intermediate_size=fd_config.model_config.moe_intermediate_size,
             num_experts=fd_config.model_config.moe_num_experts,
             top_k=fd_config.model_config.moe_k,
@@ -670,7 +671,7 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
                 self.ernie.embed_tokens.embeddings.weight.transpose([1, 0]).astype(self.lm_head.linear.weight.dtype)
             )
 
-    def compute_logits(self, hidden_states: paddle.Tensor):
+    def compute_logits(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
         logits = self.lm_head(hidden_states)
         logits = logits.astype(paddle.float32)
         logits[:, self.ori_vocab_size :] = -float("inf")
@@ -693,16 +694,17 @@ class Ernie4_5_MoeForCausalLM(ModelForCasualLM):
 
     def forward(
         self,
-        ids_remove_padding: paddle.Tensor,
+        inputs: Dict,
         forward_meta: ForwardMeta,
     ):
+        ids_remove_padding = inputs["ids_remove_padding"]
         hidden_states = self.ernie(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
 
         return hidden_states
 
-    def clear_grpah_opt_backend(self):
+    def clear_graph_opt_backend(self):
         """Clear graph optimization backend, the captured cuda graph will be cleaned"""
-        self.ernie.clear_grpah_opt_backend(fd_config=self.fd_config)
+        self.ernie.clear_graph_opt_backend(fd_config=self.fd_config)
 
 
 @ModelRegistry.register_model_class(

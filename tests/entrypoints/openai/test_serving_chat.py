@@ -20,7 +20,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-import numpy as np
 import paddle
 
 import fastdeploy.envs as envs
@@ -307,50 +306,28 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
         self.chat_completion_handler.engine_client.format_and_add_data = AsyncMock(
             side_effect=ParameterError("param", "bad")
         )
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            with patch("fastdeploy.entrypoints.openai.serving_chat.tracing.trace_req_start") as mock_trace:
-                resp = await self.chat_completion_handler.create_chat_completion(
-                    ChatCompletionRequest(
-                        messages=[{"role": "user", "content": "Hello"}],
-                        request_id="abc",
-                        stream=False,
-                    )
+        with patch("fastdeploy.entrypoints.openai.serving_chat.tracing.trace_req_start") as mock_trace:
+            resp = await self.chat_completion_handler.create_chat_completion(
+                ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    request_id="abc",
+                    stream=False,
                 )
+            )
         self.assertEqual(resp.error.param, "param")
         self.assertIn("bad", resp.error.message)
         self.assertEqual(mock_trace.call_args.kwargs["rid"], "chatcmpl-abc")
 
         self.chat_completion_handler.engine_client.format_and_add_data = AsyncMock(side_effect=RuntimeError("boom"))
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            with patch("fastdeploy.entrypoints.openai.serving_chat.tracing.trace_req_start"):
-                resp = await self.chat_completion_handler.create_chat_completion(
-                    ChatCompletionRequest(
-                        messages=[{"role": "user", "content": "Hello"}],
-                        request_id="err",
-                        stream=False,
-                    )
+        with patch("fastdeploy.entrypoints.openai.serving_chat.tracing.trace_req_start"):
+            resp = await self.chat_completion_handler.create_chat_completion(
+                ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    request_id="err",
+                    stream=False,
                 )
+            )
         self.assertIn("generator error", resp.error.message)
-
-        self.chat_completion_handler.engine_client.format_and_add_data = AsyncMock(return_value=np.array([1, 2]))
-        stream_mock = Mock(return_value="streamed")
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", True):
-            with patch(
-                "fastdeploy.entrypoints.openai.serving_chat.Request.from_generic_request",
-                return_value={"metrics": {}, "prompt_tokens": "pt", "max_tokens": 3},
-            ):
-                with patch("fastdeploy.entrypoints.openai.serving_chat.tracing.trace_req_start") as mock_trace:
-                    with patch.object(self.chat_completion_handler, "chat_completion_stream_generator", stream_mock):
-                        result = await self.chat_completion_handler.create_chat_completion(
-                            ChatCompletionRequest(
-                                messages=[{"role": "user", "content": "Hello"}],
-                                user="user",
-                                stream=True,
-                            )
-                        )
-        self.assertEqual(result, "streamed")
-        self.assertTrue(mock_trace.call_args.kwargs["rid"].startswith("chatcmpl-user-"))
-        self.assertEqual(stream_mock.call_args.args[3], [1, 2])
 
     async def test_create_chat_completion_full_and_waiting_errors(self):
         """Test full generator error and waiting error handling."""
@@ -361,15 +338,14 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
         self.chat_completion_handler.engine_client.semaphore.status = Mock(return_value="ok")
 
         self.chat_completion_handler.engine_client.format_and_add_data = AsyncMock(return_value=[1, 2])
-        with patch.object(envs, "ENABLE_V1_DATA_PROCESSOR", False):
-            with patch.object(
-                self.chat_completion_handler,
-                "chat_completion_full_generator",
-                AsyncMock(side_effect=RuntimeError("boom")),
-            ):
-                resp = await self.chat_completion_handler.create_chat_completion(
-                    ChatCompletionRequest(messages=[{"role": "user", "content": "Hello"}], stream=False)
-                )
+        with patch.object(
+            self.chat_completion_handler,
+            "chat_completion_full_generator",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            resp = await self.chat_completion_handler.create_chat_completion(
+                ChatCompletionRequest(messages=[{"role": "user", "content": "Hello"}], stream=False)
+            )
         self.assertIn("full generator error", resp.error.message)
 
         with patch(
@@ -385,7 +361,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
         response_processor = MagicMock()
         response_processor.enable_multimodal_content.return_value = True
         data = {
-            "request_id": "req_0",
+            "request_id": "req::n::0",
             "metrics": {"request_start_time": 1.0},
             "error_msg": "Recover by flag",
             "num_cached_tokens": 0,
@@ -538,7 +514,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response with prompt_logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -646,7 +622,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response with logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -782,7 +758,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
             "skipped": True,
         }
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -900,7 +876,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response without logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -994,7 +970,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response with prompt_logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -1097,7 +1073,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response with logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -1197,7 +1173,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response with both logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -1308,7 +1284,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
 
         # Create mock response without logprobs data
         mock_response = {
-            "request_id": f"{request_id}_0",
+            "request_id": f"{request_id}::n::0",
             "error_code": 200,
             "metrics": {
                 "first_token_time": 1234567890,
@@ -1443,7 +1419,7 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
         async def mock_async_generator_with_cancel():
             # Simulate some normal response first
             yield {
-                "request_id": f"{request_id}_0",
+                "request_id": f"{request_id}::n::0",
                 "error_code": 200,
                 "metrics": {
                     "first_token_time": 1234567890,
@@ -1501,6 +1477,260 @@ class TestOpenAIServingCompletion(unittest.IsolatedAsyncioTestCase):
             # Verify cleanup and abort were called despite the cancellation
             self.chat_completion_handler.engine_client.connection_manager.cleanup_request.assert_called_once()
             self.chat_completion_handler.engine_client.abort.assert_called_once()
+
+    async def test_chat_completion_stream_generator_dealer_mode_writes(self):
+        """Cover lines 261-264: dealer.write in non-batch mode for stream generator."""
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        )
+
+        request_id = "test_dealer_stream"
+        model_name = "test_model"
+        prompt_token_ids = [1, 2, 3]
+        prompt_tokens = "Hello world"
+
+        mock_dealer = MagicMock()
+        mock_response_queue = AsyncMock()
+
+        mock_response = {
+            "request_id": f"{request_id}::n::0",
+            "error_code": 200,
+            "metrics": {
+                "first_token_time": 1234567890,
+                "inference_start_time": 1234567880,
+                "arrival_time": 1234567890,
+                "request_start_time": 1234567870,
+            },
+            "prompt_logprobs": None,
+            "outputs": {
+                "token_ids": [5],
+                "text": "Hi",
+                "top_logprobs": None,
+                "draft_top_logprobs": None,
+                "multipart": [{"type": "text", "text": "Hi"}],
+                "skipped": False,
+            },
+            "finished": True,
+            "num_cached_tokens": 0,
+            "num_input_image_tokens": 0,
+            "num_input_video_tokens": 0,
+        }
+
+        mock_response_queue.get.return_value = mock_response
+        self.chat_completion_handler.engine_client.connection_manager.get_connection = AsyncMock(
+            return_value=(mock_dealer, mock_response_queue)
+        )
+        self.chat_completion_handler.engine_client.semaphore = MagicMock()
+        self.chat_completion_handler.engine_client.semaphore.acquire = AsyncMock(return_value=True)
+        self.chat_completion_handler.engine_client.semaphore.release = MagicMock()
+        self.chat_completion_handler.engine_client.check_model_weight_status = Mock(return_value=False)
+        self.chat_completion_handler.engine_client.connection_manager.cleanup_request = AsyncMock()
+
+        mock_response_processor = MagicMock()
+        mock_response_processor.enable_multimodal_content.return_value = False
+
+        async def mock_async_generator():
+            yield mock_response
+
+        mock_response_processor.process_response_chat.return_value = mock_async_generator()
+
+        with (
+            patch(
+                "fastdeploy.entrypoints.openai.serving_chat.ChatResponseProcessor",
+                return_value=mock_response_processor,
+            ),
+            patch.object(envs, "ZMQ_SEND_BATCH_DATA", False),
+        ):
+            results = []
+            async for chunk in self.chat_completion_handler.chat_completion_stream_generator(
+                request, request_id, model_name, prompt_token_ids, prompt_tokens, max_tokens=100
+            ):
+                results.append(chunk)
+
+        # Lines 262-264: dealer.write should be called for each request_id
+        mock_dealer.write.assert_called_once_with([b"", f"{request_id}::n::0".encode("utf-8")])
+        self.assertGreater(len(results), 0)
+
+    async def test_chat_completion_stream_generator_cancelled_error_in_wait(self):
+        """Cover lines 278, 280: CancelledError during response_queue.get propagates."""
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        )
+
+        request_id = "test_cancel_wait"
+        model_name = "test_model"
+        prompt_token_ids = [1, 2, 3]
+        prompt_tokens = "Hello world"
+
+        mock_dealer = MagicMock()
+        mock_response_queue = AsyncMock()
+        # Simulate CancelledError during wait_for(response_queue.get())
+        mock_response_queue.get.side_effect = asyncio.CancelledError()
+
+        self.chat_completion_handler.engine_client.connection_manager.get_connection = AsyncMock(
+            return_value=(mock_dealer, mock_response_queue)
+        )
+        self.chat_completion_handler.engine_client.semaphore = MagicMock()
+        self.chat_completion_handler.engine_client.semaphore.acquire = AsyncMock(return_value=True)
+        self.chat_completion_handler.engine_client.semaphore.release = MagicMock()
+        self.chat_completion_handler.engine_client.check_model_weight_status = Mock(return_value=False)
+        self.chat_completion_handler.engine_client.connection_manager.cleanup_request = AsyncMock()
+        self.chat_completion_handler.engine_client.abort = AsyncMock()
+
+        with patch.object(envs, "ZMQ_SEND_BATCH_DATA", True):
+            chunks = []
+            try:
+                async for chunk in self.chat_completion_handler.chat_completion_stream_generator(
+                    request, request_id, model_name, prompt_token_ids, prompt_tokens, max_tokens=100
+                ):
+                    chunks.append(chunk)
+            except asyncio.CancelledError:
+                pass
+
+        # Cleanup should still be called
+        self.chat_completion_handler.engine_client.connection_manager.cleanup_request.assert_called_once()
+
+    async def test_chat_completion_full_generator_dealer_mode_writes(self):
+        """Cover lines 558-561: dealer.write in non-batch mode for full generator."""
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=False,
+        )
+
+        request_id = "test_dealer_full"
+        model_name = "test_model"
+        prompt_token_ids = [1, 2, 3]
+        prompt_tokens = "Hello world"
+
+        mock_dealer = MagicMock()
+        mock_response_queue = AsyncMock()
+
+        mock_response = {
+            "request_id": f"{request_id}::n::0",
+            "error_code": 200,
+            "metrics": {
+                "first_token_time": 1234567890,
+                "inference_start_time": 1234567880,
+                "arrival_time": 1234567890,
+                "request_start_time": 1234567870,
+            },
+            "prompt_logprobs": None,
+            "outputs": {
+                "text": "Hello there",
+                "metrics": {"request_start_time": 1.0},
+                "reasoning_content": "",
+                "tool_calls": None,
+                "completion_tokens": "2",
+                "token_ids": [5, 6],
+                "top_logprobs": None,
+                "draft_top_logprobs": None,
+                "multipart": [{"type": "text", "text": "Hello there"}],
+            },
+            "finished": True,
+            "num_cached_tokens": 0,
+            "num_input_image_tokens": 0,
+            "num_input_video_tokens": 0,
+        }
+
+        mock_response_queue.get.return_value = mock_response
+        self.chat_completion_handler.engine_client.connection_manager.get_connection = AsyncMock(
+            return_value=(mock_dealer, mock_response_queue)
+        )
+        self.chat_completion_handler.engine_client.semaphore = MagicMock()
+        self.chat_completion_handler.engine_client.semaphore.acquire = AsyncMock(return_value=True)
+        self.chat_completion_handler.engine_client.semaphore.release = MagicMock()
+        self.chat_completion_handler.engine_client.check_model_weight_status = Mock(return_value=False)
+        self.chat_completion_handler.engine_client.connection_manager.cleanup_request = AsyncMock()
+
+        mock_response_processor = MagicMock()
+        mock_response_processor.enable_multimodal_content.return_value = False
+
+        async def mock_async_generator():
+            yield mock_response
+
+        mock_response_processor.process_response_chat.return_value = mock_async_generator()
+
+        with (
+            patch(
+                "fastdeploy.entrypoints.openai.serving_chat.ChatResponseProcessor",
+                return_value=mock_response_processor,
+            ),
+            patch.object(envs, "ZMQ_SEND_BATCH_DATA", False),
+        ):
+            await self.chat_completion_handler.chat_completion_full_generator(
+                request, request_id, model_name, prompt_token_ids, prompt_tokens, max_tokens=100
+            )
+
+        # Lines 559-561: dealer.write should be called for each request_id
+        mock_dealer.write.assert_called_once_with([b"", f"{request_id}::n::0".encode("utf-8")])
+
+
+class TestLogprobsWithMultiModalProcessor(unittest.TestCase):
+    """Regression tests: process_logprob_response must be accessible via MultiModalProcessor.
+
+    Previously, process_logprob_response was only defined in TextProcessor.
+    MultiModalProcessor inherits directly from BaseTextProcessor, so it would
+    raise AttributeError when serving_chat.py called
+    engine_client.data_processor.process_logprob_response(...) on multimodal paths.
+    """
+
+    def setUp(self):
+        self.mock_engine = MagicMock()
+        self.chat_completion_handler = OpenAIServingChat(
+            self.mock_engine,
+            models=None,
+            pid=123,
+            ips=None,
+            max_waiting_time=10,
+            chat_template=None,
+        )
+
+        # Replace the auto-created MagicMock data_processor with a real
+        # MultiModalProcessor instance (with __init__ bypassed) so that
+        # any missing method would surface as AttributeError instead of
+        # silently succeeding via MagicMock auto-attribute creation.
+        from fastdeploy.input.multimodal_processor import MultiModalProcessor
+
+        with patch.object(MultiModalProcessor, "__init__", return_value=None):
+            mm_proc = MultiModalProcessor.__new__(MultiModalProcessor)
+        mm_proc.tokenizer = MagicMock()
+        mm_proc.tokenizer.decode = MagicMock(return_value="tok")
+        self.chat_completion_handler.engine_client.data_processor = mm_proc
+
+    def test_build_logprobs_response_with_multimodal_processor(self):
+        """_build_logprobs_response must not raise AttributeError with MultiModalProcessor."""
+        from fastdeploy.worker.output import LogprobsLists
+
+        top_logprobs = LogprobsLists(
+            logprob_token_ids=[[1, 2]],
+            logprobs=[[-0.1, -0.2]],
+            sampled_token_ranks=[1],
+        )
+        # Should not raise AttributeError — this was the original bug.
+        result = self.chat_completion_handler._build_logprobs_response(True, top_logprobs, 0, True)
+        self.assertIsNotNone(result)
+        self.chat_completion_handler.engine_client.data_processor.tokenizer.decode.assert_called()
+
+    def test_build_prompt_logprobs_with_multimodal_processor(self):
+        """_build_prompt_logprobs must not raise AttributeError with MultiModalProcessor."""
+        import paddle
+
+        from fastdeploy.worker.output import LogprobsTensors
+
+        token_ids = paddle.to_tensor([[1, 2]], dtype=paddle.int64)
+        logprobs = paddle.to_tensor([[-0.1, -0.5]], dtype=paddle.float32)
+        ranks = paddle.to_tensor([1], dtype=paddle.int64)
+        prompt_logprobs_tensors = LogprobsTensors(token_ids, logprobs, ranks)
+
+        result = self.chat_completion_handler._build_prompt_logprobs(
+            prompt_logprobs_tensors,
+            num_prompt_logprobs=1,
+            include_logprobs_decode_token=True,
+        )
+        self.assertIsNotNone(result)
+        self.chat_completion_handler.engine_client.data_processor.tokenizer.decode.assert_called()
 
 
 if __name__ == "__main__":

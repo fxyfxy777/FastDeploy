@@ -7,7 +7,11 @@ python -m pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/p
 
 python -m pip install -r requirements.txt
 python -m pip install jsonschema aistudio_sdk==0.3.5
-python -m pip install xgrammar==0.1.19 torch==2.6.0
+# Use prebuilt wheel files to install xgrammar==0.1.19 and torch==2.6.0 specifically for the CI environment
+python -m pip install  \
+  https://paddle-qa.bj.bcebos.com/FastDeploy/torch-2.6.0-cp310-cp310-manylinux1_x86_64.whl \
+  https://paddle-qa.bj.bcebos.com/FastDeploy/triton-3.2.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
+  https://paddle-qa.bj.bcebos.com/FastDeploy/xgrammar-0.1.19-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 
 failed_files=()
 run_path="$DIR/../tests/ci_use/"
@@ -32,9 +36,16 @@ for subdir in "$run_path"*/; do
                 ps -ef | grep "${FD_ENGINE_QUEUE_PORT}" | grep -v grep | awk '{print $2}' | xargs -r kill -9
 
                 if [ $exit_code -ne 0 ]; then
-                    if [ -f "${subdir%/}/log/workerlog.0" ]; then
-                        echo "---------------- log/workerlog.0 -------------------"
-                        cat "${subdir%/}/log/workerlog.0"
+                    if [ -d "${subdir%/}/log" ]; then
+                        echo ">>> grep error in ${subdir%/}/log/"
+                        grep -Rni --color=auto "error" "${subdir%/}/log/" --exclude="pytest_*_error.log" --exclude="backup_env.*.json" --exclude="default.*.log" --exclude="envlog.*" || true
+                    else
+                        echo "${subdir%/}/log directory not found"
+                    fi
+
+                    if [ -f "${subdir%/}/log/paddle/workerlog.0" ]; then
+                        echo "---------------- log/paddle/workerlog.0 -------------------"
+                        cat "${subdir%/}/log/paddle/workerlog.0"
                         echo "----------------------------------------------------"
                     fi
 

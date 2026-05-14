@@ -14,6 +14,8 @@
 # limitations under the License.
 """
 
+import importlib
+import importlib.util
 import os
 import re
 from collections.abc import Mapping
@@ -51,7 +53,7 @@ class BitMaskTracker:
             end (int): End index (exclusive)
         """
         if start < 0 or end > self.length or start >= end:
-            raise ValueError("Invalid mark range")
+            raise ValueError(f"Invalid mark range: start={start}, end={end}, length={self.length}")
         block = ((1 << (end - start)) - 1) << start
         self.mask |= block
 
@@ -82,7 +84,7 @@ class TensorTracker:
             self.track_dim = 2 if output_dim else 1
             self.trackers = [BitMaskTracker(shape[self.track_dim]) for _ in range(batch)]
         else:
-            raise ValueError("Only 2D or 3D tensors supported")
+            raise ValueError(f"Only 2D or 3D tensors supported, got {len(shape)}D tensor with shape={shape}")
 
     def mark(self, start: int = 0, end: int = None, batch_id: int = None):
         """
@@ -115,18 +117,18 @@ def set_weight_attrs(param, param_attr_map: Optional[dict[str, Any]]):
         setattr(param, key, value)
 
 
-def slice_fn(weight_or_paramter, output_dim, start, end, step=1):
-    if hasattr(weight_or_paramter, "get_shape"):
-        shape = weight_or_paramter.get_shape()
+def slice_fn(weight_or_parameter, output_dim, start, end, step=1):
+    if hasattr(weight_or_parameter, "get_shape"):
+        shape = weight_or_parameter.get_shape()
     else:
-        shape = weight_or_paramter.shape
+        shape = weight_or_parameter.shape
     if len(shape) == 1:
-        weight_or_paramter = weight_or_paramter[start:end]
+        weight_or_parameter = weight_or_parameter[start:end]
     elif output_dim:
-        weight_or_paramter = weight_or_paramter[..., start:end]
+        weight_or_parameter = weight_or_parameter[..., start:end]
     else:
-        weight_or_paramter = weight_or_paramter[start:end, ...]
-    return weight_or_paramter
+        weight_or_parameter = weight_or_parameter[start:end, ...]
+    return weight_or_parameter
 
 
 def process_weight_transpose(layer, weight_name):
@@ -539,6 +541,7 @@ def rename_offline_ckpt_suffix_to_fd_suffix(
         if fd_config.quant_config is None or fd_config.quant_config.is_checkpoint_bf16:
             return loaded_weight_name
         # Can be extended to other offline quantization suffixes if needed.
+        fd_suffix_map = {}
         if (is_moe and moe_quant_type == "block_wise_fp8") or (not is_moe and dense_quant_type == "block_wise_fp8"):
             fd_suffix_map = fp8_suffix_map
         if (is_moe and moe_quant_type == "tensor_wise_fp8") or (not is_moe and dense_quant_type == "tensor_wise_fp8"):
@@ -550,6 +553,10 @@ def rename_offline_ckpt_suffix_to_fd_suffix(
         return loaded_weight_name
 
     return fn
+
+
+def has_flashinfer():
+    return importlib.util.find_spec("flashinfer") is not None
 
 
 @cache

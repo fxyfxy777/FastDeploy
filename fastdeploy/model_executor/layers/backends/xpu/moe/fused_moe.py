@@ -313,7 +313,7 @@ class XPUMoEMethod(MoEMethodBase):
         """
         gate_out = gate(x.cast("float32"))
         if layer.topk_method == "noaux_tc":
-            _, topk_idx, topk_weights = get_moe_scores(
+            _, topk_weights, topk_idx = get_moe_scores(
                 gate_out,
                 layer.n_group,
                 layer.topk_group,
@@ -558,6 +558,7 @@ class XPUMoEMethod(MoEMethodBase):
         x: paddle.Tensor,
         gate: nn.Layer,
         topk_ids_hookfunc: Callable = None,
+        shared_experts: nn.Layer = None,
     ) -> paddle.Tensor:
         """
         compute Fused MoE.

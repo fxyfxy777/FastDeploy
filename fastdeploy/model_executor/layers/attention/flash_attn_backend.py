@@ -25,12 +25,14 @@ from paddleformers.utils.log import logger
 
 try:
     from paddle.nn.functional.flash_attention import flash_attention_v3_varlen
-except:
+except Exception as e:
+    logger.debug(f"flash_attention_v3_varlen not available: {e}")
     flash_attention_v3_varlen = None
 
 try:
     from paddle.nn.functional.flash_attention import flashmask_attention
-except:
+except Exception as e:
+    logger.debug(f"flashmask_attention not available: {e}")
     flashmask_attention = None
 
 from fastdeploy.config import FDConfig
@@ -82,7 +84,7 @@ def init_flash_attn_version():
         sm_version = get_sm_version()
         if sm_version >= 100:
             try:
-                paddle.compat.enable_torch_proxy(scope={"cutlass"})
+                paddle.enable_compat(scope={"cutlass"})
                 from flash_mask.cute.interface import flashmask_attention as fa4
 
                 global flashmask_attention_v4
@@ -93,7 +95,7 @@ def init_flash_attn_version():
                 logger.info(f"The current platform[sm{get_sm_version()}] can't import Flash Attention V4.")
 
         if FLASH_ATTN_VERSION is None:
-            if sm_version >= 89 and any(num >= 89 for num in paddle.version.cuda_archs()):
+            if sm_version == 90 and 90 in paddle.version.cuda_archs():
                 FLASH_ATTN_VERSION = 3
                 logger.info("The current platform supports Flash Attention V3.")
             else:
@@ -273,6 +275,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_method = fd_config.speculative_config.method
         self.use_speculate = self.speculative_method is not None
         self.speculate_max_draft_token_num = fd_config.speculative_config.num_speculative_tokens
+        if not self.use_speculate:
+            self.speculate_max_draft_token_num = 0
         self.keep_pd_step_flag: bool = fd_config.speculative_config.model_type == "mtp"
         self.num_layers_draft_model: int = int(fd_config.speculative_config.method == SpecMethod.MTP)
 
@@ -282,9 +286,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.rank, self.device_id = init_rank_and_device_id(fd_config)
 
-        self.rope_3d: bool = getattr(fd_config.model_config, "rope_3d", False) or getattr(
-            fd_config.model_config, "use_3d_rope", False
-        )
+        self.rope_3d: bool = fd_config.enable_rope_3d_runtime
         if fd_config.speculative_config.model_type != "main":
             self.rope_3d = False
         # Note(ZKK): here must be consistent with append_attn_backend.py
@@ -370,6 +372,18 @@ class FlashAttentionBackend(AttentionBackend):
         q_norm_weight = getattr(layer, "q_norm_weight", None) if norm_after_rope_in_kernel else None
         k_norm_weight = getattr(layer, "k_norm_weight", None) if norm_after_rope_in_kernel else None
 
+        cache_quant_type_str = getattr(layer, "cache_quant_type_str", "none")
+        if cache_quant_type_str == "block_wise_fp8":
+            cache_k = forward_meta.caches[4 * layer.layer_id]
+            cache_v = forward_meta.caches[4 * layer.layer_id + 1]
+            cache_k_scales = forward_meta.caches[4 * layer.layer_id + 2]
+            cache_v_scales = forward_meta.caches[4 * layer.layer_id + 3]
+        else:
+            cache_k = forward_meta.caches[2 * layer.layer_id]
+            cache_v = forward_meta.caches[2 * layer.layer_id + 1]
+            cache_k_scales = getattr(layer, "cache_k_scale", None)
+            cache_v_scales = getattr(layer, "cache_v_scale", None)
+
         if layer.layer_id == 0:
             get_block_shape_and_split_kv_block(
                 forward_meta.seq_lens_encoder,
@@ -427,8 +441,8 @@ class FlashAttentionBackend(AttentionBackend):
         if use_fa_do_prefill:
             q, k, v, _ = gqa_rope_write_cache(
                 qkv,
-                forward_meta.caches[2 * layer.layer_id],
-                forward_meta.caches[2 * layer.layer_id + 1],
+                cache_k,
+                cache_v,
                 forward_meta.cu_seqlens_q,
                 forward_meta.cu_seqlens_k,
                 forward_meta.rotary_embs,
@@ -445,8 +459,8 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_meta.pre_cache_num_blocks_cpu,
                 q_norm_weight,
                 k_norm_weight,
-                getattr(layer, "cache_k_scale", None),
-                getattr(layer, "cache_v_scale", None),
+                cache_k_scales,
+                cache_v_scales,
                 getattr(layer, "cache_k_out_scale", None),
                 getattr(layer, "cache_v_out_scale", None),
                 getattr(layer, "cache_k_zp", None),
@@ -477,8 +491,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         res_decoder = append_attention(
             qkv,
-            forward_meta.caches[2 * layer.layer_id],
-            forward_meta.caches[2 * layer.layer_id + 1],
+            cache_k,
+            cache_v,
             forward_meta.seq_lens_encoder,
             forward_meta.seq_lens_decoder,
             forward_meta.seq_lens_this_time,
@@ -499,8 +513,8 @@ class FlashAttentionBackend(AttentionBackend):
             forward_meta.attn_mask,
             layer.qkv_bias,
             layer.qkv_scale,
-            getattr(layer, "cache_k_scale", None),
-            getattr(layer, "cache_v_scale", None),
+            cache_k_scales,
+            cache_v_scales,
             getattr(layer, "cache_k_out_scale", None),
             getattr(layer, "cache_v_out_scale", None),
             getattr(layer, "cache_k_zp", None),

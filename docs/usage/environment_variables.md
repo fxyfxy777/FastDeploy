@@ -15,8 +15,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log directory
     "FD_LOG_DIR": lambda: os.getenv("FD_LOG_DIR", "log"),
 
+    # Global log level, prefer this over FD_DEBUG. Supports "INFO" and "DEBUG".
+    "FD_LOG_LEVEL": lambda: os.getenv("FD_LOG_LEVEL", None),
+
     # Enable debug mode (0 or 1)
     "FD_DEBUG": lambda: int(os.getenv("FD_DEBUG", "0")),
+
+    # Request logging master switch. Set to 0 to disable request logging.
+    "FD_LOG_REQUESTS": lambda: int(os.getenv("FD_LOG_REQUESTS", "1")),
+
+    # Request logging detail level (0-3). Higher level means more verbose output.
+    "FD_LOG_REQUESTS_LEVEL": lambda: int(os.getenv("FD_LOG_REQUESTS_LEVEL", "2")),
+
+    # Whether to open Trace (off/local/otel/all)
+    "FD_TRACE": lambda: os.getenv("FD_TRACE", "off").lower(),
 
     # FastDeploy log retention days
     "FD_LOG_BACKUP_COUNT": lambda: os.getenv("FD_LOG_BACKUP_COUNT", "7"),
@@ -71,9 +83,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Whether to use aggregate send
     "FD_USE_AGGREGATE_SEND": lambda: bool(int(os.getenv("FD_USE_AGGREGATE_SEND", "0"))),
-
-    # Whether to open Trace
-    "TRACES_ENABLE": lambda: os.getenv("TRACES_ENABLE", "false"),
 
     # Set trace server name
     "FD_SERVICE_NAME": lambda: os.getenv("FD_SERVICE_NAME", "FastDeploy"),
@@ -146,9 +155,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Whether to enable the decode caches requests for preallocating resource
     "FD_ENABLE_CACHE_TASK": lambda: os.getenv("FD_ENABLE_CACHE_TASK", "0"),
-
-    # Batched token timeout in EP
-    "FD_EP_BATCHED_TOKEN_TIMEOUT": lambda: float(os.getenv("FD_EP_BATCHED_TOKEN_TIMEOUT", "0.1")),
 
     # Max pre-fetch requests number in PD
     "FD_EP_MAX_PREFETCH_TASK_NUM": lambda: int(os.getenv("FD_EP_MAX_PREFETCH_TASK_NUM", "8")),

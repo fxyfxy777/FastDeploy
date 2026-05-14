@@ -51,6 +51,19 @@ if current_platform.is_cuda():
 else:
     fp8_gemm_nt = None
 
+# Detect whether fp8_gemm_nt accepts a 'bias' keyword argument
+_fp8_gemm_nt_has_bias_kwarg = False
+if fp8_gemm_nt is not None:
+    import inspect
+
+    try:
+        _sig = inspect.signature(fp8_gemm_nt)
+        _fp8_gemm_nt_has_bias_kwarg = "bias" in _sig.parameters
+    except (ValueError, TypeError):
+        # pybind11 functions may not expose signatures via inspect;
+        # fall back to a cheap probe call to determine support.
+        pass
+
 
 class BlockWiseFP8Config(QuantConfigBase):
     """
@@ -66,8 +79,16 @@ class BlockWiseFP8Config(QuantConfigBase):
         self.quant_min_bound = -448
         self.quant_round_type = 1
         self.use_deep_gemm = bool(envs.FD_USE_DEEP_GEMM)
+        self.use_blackwell_gemm = bool(envs.FD_USE_BLACKWELL_GEMM)
         self.is_checkpoint_bf16 = is_checkpoint_bf16
-        self.deepgemm_scale_ue8m0 = True if get_sm_version() == 100 else False
+        self.deepgemm_scale_ue8m0 = True if get_sm_version() >= 100 else False
+
+        self.moe_blockwise_gemm_scale_ue8m0 = self.deepgemm_scale_ue8m0
+        # ZKK add this code!
+        if self.deepgemm_scale_ue8m0:
+            # triton backend only used float32 scale!!!!
+            if not (self.use_deep_gemm or self.use_blackwell_gemm):
+                self.moe_blockwise_gemm_scale_ue8m0 = False
 
     def name(self) -> str:
         return "block_wise_fp8"
@@ -83,7 +104,16 @@ class BlockWiseFP8Config(QuantConfigBase):
         Get quantization method.
         """
         if isinstance(layer, FusedMoE):
-            if layer.ep_size > 1 or self.use_deep_gemm:
+            if self.use_blackwell_gemm:
+                assert (
+                    self.use_deep_gemm
+                ), "Blackwell gemm is supported only for prefill moe, please set FD_USE_DEEP_GEMM=1 as well"
+                from fastdeploy.model_executor.layers.moe.fused_moe_blackwell_backend import (
+                    BlackwellGemmFusedMoeMethod,
+                )
+
+                return BlackwellGemmFusedMoeMethod(self)
+            elif layer.ep_size > 1 or self.use_deep_gemm:
                 from fastdeploy.model_executor.layers.moe.fused_moe_deepgemm_backend import (
                     DeepGemmFusedMoeMethod,
                 )
@@ -123,13 +153,32 @@ def deep_gemm_fp8_gemm_nt(
     layer_weight_scale_inv: paddle.Tensor,
     linear_out: paddle.Tensor,
     layer_output_size: int,
+    bias: paddle.Tensor = None,
 ):
-    # disable_ue8m0_cast is default False for SM100
-    fp8_gemm_nt(
-        (x, x_scale_tensor),
-        (layer_weight, layer_weight_scale_inv),
-        linear_out,
-    )
+    sm_version = get_sm_version()
+    if sm_version >= 100 and current_platform.is_cuda():
+        # disable_ue8m0_cast is default False for SM100
+        if _fp8_gemm_nt_has_bias_kwarg:
+            fp8_gemm_nt(
+                (x, x_scale_tensor),
+                (layer_weight, layer_weight_scale_inv),
+                linear_out,
+                bias=bias,
+            )
+        else:
+            fp8_gemm_nt(
+                (x, x_scale_tensor),
+                (layer_weight, layer_weight_scale_inv),
+                linear_out,
+            )
+            if bias is not None:
+                linear_out.add_(bias)
+    else:
+        fp8_gemm_nt(
+            (x, x_scale_tensor),
+            (layer_weight, layer_weight_scale_inv),
+            linear_out,
+        )
     return linear_out
 
 
@@ -332,19 +381,31 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
         else:
             x, x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
                 x,
-                using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
+                using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0 or fastdeploy.envs.FD_FP8_QUANT_WITH_POW2SCALE,
                 output_scale_transpose=True,
                 using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
             )
             x_scale_tensor = x_scale_tensor.T[: x.shape[0], ...]
-        deep_gemm_fp8_gemm_nt(
-            x,
-            x_scale_tensor,
-            layer.weight,
-            layer.weight_scale_inv,
-            linear_out,
-            layer_output_size=layer.output_size,
-        )
-        if layer.with_bias:
-            linear_out = paddle.add(linear_out, layer.bias)
+
+        if get_sm_version() >= 100 and current_platform.is_cuda():
+            deep_gemm_fp8_gemm_nt(
+                x,
+                x_scale_tensor,
+                layer.weight,
+                layer.weight_scale_inv,
+                linear_out,
+                layer_output_size=layer.output_size,
+                bias=layer.bias if layer.with_bias else None,
+            )
+        else:
+            deep_gemm_fp8_gemm_nt(
+                x,
+                x_scale_tensor,
+                layer.weight,
+                layer.weight_scale_inv,
+                linear_out,
+                layer_output_size=layer.output_size,
+            )
+            if layer.with_bias:
+                linear_out = paddle.add(linear_out, layer.bias)
         return linear_out

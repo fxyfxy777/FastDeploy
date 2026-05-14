@@ -18,6 +18,7 @@
 #include <sys/msg.h>
 #include <sys/types.h>
 #include "paddle/extension.h"
+#include "../custom_ftok.h"
 
 #ifndef PD_BUILD_STATIC_OP
 #define PD_BUILD_STATIC_OP(name) PD_BUILD_OP(static_op_##name)
@@ -35,8 +36,9 @@ void SpeculateSaveWithOutputMsg(const paddle::Tensor& accept_tokens,
                                 int msg_queue_id,
                                 int save_each_rank,
                                 bool skip_prefill) {
-  // printf("enter save output");
-  if (!save_each_rank && rank_id > 0) {
+  // NOTE(yaohuicong): Skip non-zero TP ranks — they share identical sampling
+  // outputs, so only rank 0 needs to send results to the message queue.
+  if (rank_id > 0) {
     return;
   }
 
@@ -66,7 +68,7 @@ void SpeculateSaveWithOutputMsg(const paddle::Tensor& accept_tokens,
     msg_queue_id = inference_msg_queue_id_from_env;
   }
   static struct speculate_msgdata msg_sed;
-  static key_t key = ftok("./", msg_queue_id);
+  static key_t key = custom_ftok("./", msg_queue_id);
   static int msgid = msgget(key, IPC_CREAT | 0666);
 
   msg_sed.mtype = 1;

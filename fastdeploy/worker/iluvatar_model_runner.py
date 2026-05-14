@@ -17,10 +17,11 @@
 from functools import partial
 
 import paddle
+from paddleformers.utils.log import logger
 
 from fastdeploy import envs
 from fastdeploy.config import FDConfig
-from fastdeploy.model_executor.layers.attention import IluvatarAttnBackend
+from fastdeploy.model_executor.layers.attention import get_attention_backend
 from fastdeploy.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -66,7 +67,7 @@ class IluvatarModelRunner(GPUModelRunner):
                 not self.cache_config.enable_chunked_prefill
             ), "Iluvatar does not support chunked prefill for VL model"
 
-        print(f"self.use_cudagraph={self.use_cudagraph}")
+        logger.info(f"self.use_cudagraph={self.use_cudagraph}")
         # VL neox style = True
         emb_shape = self.share_inputs["rope_emb"].shape
         if emb_shape[-1] == self.model_config.head_dim // 2:
@@ -81,14 +82,17 @@ class IluvatarModelRunner(GPUModelRunner):
         """
         Initialize attention backends
         """
-        assert len(self.attn_backends) == 0
+        assert (
+            len(self.attn_backends) == 0
+        ), f"attn_backends should be empty before initialization, got {len(self.attn_backends)} backends"
 
         num_heads = self.model_config.num_attention_heads // self.parallel_config.tensor_parallel_size
         self.model_config.kv_num_heads = max(
             1,
             int(self.model_config.num_key_value_heads) // self.parallel_config.tensor_parallel_size,
         )
-        attn_backend = IluvatarAttnBackend(
+        attn_cls = get_attention_backend()
+        attn_backend = attn_cls(
             self.fd_config,
             kv_num_heads=self.model_config.kv_num_heads,
             num_heads=num_heads,

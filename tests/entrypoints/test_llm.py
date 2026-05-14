@@ -42,8 +42,8 @@ class DummyDataProcessor:
     def process_logprob_response(self, token_ids, clean_up_tokenization_spaces: bool = False):
         return f"tok_{token_ids[0]}"
 
-    def process_response(self, result):
-        return result
+    def process_response_dict(self, response_dict, **kwargs):
+        return response_dict
 
     def process_response_dict_streaming(self, response_dict, stream, enable_thinking, include_stop_str_in_output):
         tokens = "".join(f"tok_{tid}" for tid in response_dict["outputs"]["token_ids"])
@@ -60,6 +60,18 @@ class DummyResult:
 
     def add(self, other):
         self.added = True
+
+    def to_dict(self):
+        return {
+            "request_id": self.request_id,
+            "finished": self.finished,
+            "prompt_logprobs": self.prompt_logprobs,
+            "outputs": {
+                "token_ids": self.outputs.token_ids,
+                "top_logprobs": self.outputs.top_logprobs,
+                "logprobs": self.outputs.logprobs,
+            },
+        }
 
 
 def _make_engine(vocab_size=5, max_logprobs=5, enable_logprob=True, enable_prefix_caching=False, is_master=True):
@@ -136,7 +148,9 @@ def test_receive_output_merges():
     assert first.added is True
 
 
-def test_receive_output_logs_exception(caplog):
+def test_receive_output_logs_exception():
+    from unittest.mock import patch
+
     llm = _make_llm(_make_engine())
     calls = iter([RuntimeError("boom"), SystemExit()])
 
@@ -147,9 +161,14 @@ def test_receive_output_logs_exception(caplog):
         return nxt
 
     llm.llm_engine._get_generated_result = _get_generated_result
-    with pytest.raises(SystemExit):
-        llm._receive_output()
-    assert "Unexcepted error happened" in caplog.text
+    with patch("fastdeploy.entrypoints.llm.log_request_error") as mock_log:
+        with pytest.raises(SystemExit):
+            llm._receive_output()
+        mock_log.assert_called_once()
+        call_kwargs = mock_log.call_args[1]
+        assert "Unexpected error happened" in call_kwargs.get(
+            "message", mock_log.call_args[0][0] if mock_log.call_args[0] else ""
+        )
 
 
 def test_generate_and_chat_branches():
@@ -255,7 +274,8 @@ def test_run_engine_and_streaming(monkeypatch):
 
     llm_module.tqdm = DummyTqdm
     out = llm._run_engine(["r1"], use_tqdm=True, topk_logprobs=-1, num_prompt_logprobs=-1)
-    assert out[0] is result
+    assert out[0].request_id == result.request_id
+    assert out[0].finished == result.finished
 
     current = DummyResult(
         "r2",

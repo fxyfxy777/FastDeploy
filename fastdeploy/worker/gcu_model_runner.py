@@ -62,7 +62,7 @@ class GCUModelRunner(ModelRunnerBase):
         local_rank: int,
     ):
         super().__init__(fd_config=fd_config, device=device)
-        self.enable_mm = self.model_config.enable_mm
+        self.enable_mm = self.fd_config.enable_mm_runtime
         self.rank = rank
         self.local_rank = local_rank
         self.device_id = device_id
@@ -615,7 +615,7 @@ class GCUModelRunner(ModelRunnerBase):
             not ((self.share_inputs["seq_lens_this_time"] > 1).sum() > 0)
         )
 
-        # Initialzie attention meta data
+        # Initialize attention meta data
         for attn_backend in self.attn_backends:
             attn_backend.init_attention_metadata(self.forward_meta)
 
@@ -669,7 +669,9 @@ class GCUModelRunner(ModelRunnerBase):
         """
         Initialize attention backends
         """
-        assert len(self.attn_backends) == 0
+        assert (
+            len(self.attn_backends) == 0
+        ), f"attn_backends should be empty before initialization, got {len(self.attn_backends)} backends"
 
         num_heads = self.model_config.num_attention_heads // self.parallel_config.tensor_parallel_size
         self.model_config.kv_num_heads = max(
@@ -757,8 +759,9 @@ class GCUModelRunner(ModelRunnerBase):
             self.padding_cudagraph_inputs()
 
             # 3. Run model
+            model_inputs = {"ids_remove_padding": self.share_inputs["ids_remove_padding"]}
             model_output = self.model(
-                ids_remove_padding=self.share_inputs["ids_remove_padding"],
+                model_inputs,
                 forward_meta=self.forward_meta,
             )
 
@@ -985,8 +988,9 @@ class GCUModelRunner(ModelRunnerBase):
         # 2. Padding inputs for cuda graph
 
         # 3. Execute model
+        model_inputs = {"ids_remove_padding": self.share_inputs["ids_remove_padding"]}
         model_output = self.model(
-            ids_remove_padding=self.share_inputs["ids_remove_padding"],
+            model_inputs,
             forward_meta=self.forward_meta,
         )
 

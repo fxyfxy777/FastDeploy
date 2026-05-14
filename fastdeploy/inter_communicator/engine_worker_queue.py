@@ -549,7 +549,6 @@ class EngineWorkerQueue:
             self.lock.release()
             time.sleep(0.001)
             self.lock.acquire()
-
         if envs.FD_ENABLE_MAX_PREFILL or envs.FD_ENABLE_E2W_TENSOR_CONVERT:
             # multimodal input numpy -> tensor
             to_tensor(tasks[0])
@@ -571,7 +570,6 @@ class EngineWorkerQueue:
         """
         tasks: List[Any] = list()
         self.lock.acquire()
-
         tasks.extend(self.tasks)
         self.client_read_flag[self.client_id] = 1
         all_client_read: bool = np.sum(self.client_read_flag) == self.num_client
@@ -797,7 +795,9 @@ class EngineWorkerQueue:
         if len(self.finished_add_cache_task_list) > 0:
             response = self.finished_add_cache_task_list[0]
         for tmp_response in self.finished_add_cache_task_list:
-            assert tmp_response == response
+            assert (
+                tmp_response == response
+            ), f"Inconsistent responses across workers: expected {response}, got {tmp_response}"
         self.finished_add_cache_task_list[:] = list()
         self.client_get_finished_add_cache_task_flag[:] = [0] * self.num_client
         self.can_put_next_add_task_finished_flag.set(1)
@@ -835,6 +835,10 @@ class EngineWorkerQueue:
         self.lock.acquire()
         self.tasks[:] = list()
         self.client_read_flag[:] = [1] * self.num_client
+        if self.is_single_node:
+            self.exist_tasks_intra_signal.value[0] = 0
+        else:
+            self.exist_tasks_inter_signal.set(0)
         self.lock.release()
         llm_logger.info("clear data for engine worker queue")
 
@@ -844,3 +848,13 @@ class EngineWorkerQueue:
         """
         if self.manager is not None and self.is_server:
             self.manager.shutdown()
+
+    def is_broken(self):
+        try:
+            self.manager.connect()
+            return False
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError, EOFError, OSError):
+            llm_logger.error("Failed to connect to engine worker queue")
+            return True
+        except Exception:
+            return False
