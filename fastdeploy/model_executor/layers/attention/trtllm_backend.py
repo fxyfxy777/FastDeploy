@@ -97,6 +97,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     active_cu_seqlens_q: paddle.Tensor = None
     cum_seq_lens_kv: paddle.Tensor = None
 
+    # 预计算字段（将动态索引操作移出 forward_mixed，兼容 CUDA Graph）
+    # prefill 相关
+    prefill_seq_lens: paddle.Tensor = None
+    prefill_block_tables: paddle.Tensor = None
+    prefill_total_seq_len: paddle.Tensor = None
+    prefill_max_q_len: int = 0
+    prefill_max_kv_len: int = 0
+    prefill_cum_seq_lens_q: paddle.Tensor = None
+    prefill_cum_seq_lens_kv: paddle.Tensor = None
+    # decode 相关
+    decode_block_tables: paddle.Tensor = None
+    decode_total_seq_len: paddle.Tensor = None
+
 
 save_step_id = 1
 
@@ -167,6 +180,7 @@ class TrtllmAttentionBackend(AttentionBackend):
         self.block_kv_indptr_gpu = paddle.zeros(
             shape=[fd_config.scheduler_config.max_num_seqs + 1], dtype=paddle.int32
         )
+        self.workspace_buffer = paddle.empty(394 * 1024 * 1024, dtype=paddle.int8)
 
     def get_attention_meta(self):
         """get_attention_meta"""
@@ -251,6 +265,39 @@ class TrtllmAttentionBackend(AttentionBackend):
             self.block_kv_indptr_gpu[1 : metadata.num_running_requests + 1] = paddle.cumsum(num_blocks)
             metadata.cum_seq_lens_kv = self.block_kv_indptr_gpu[: metadata.num_running_requests + 1]
             metadata.active_cu_seqlens_q = forward_meta.cu_seqlens_q[: metadata.num_running_requests + 1]
+
+            # 预计算 prefill 动态索引（移出 forward_mixed 以兼容 CUDA Graph）
+            prefill_start = metadata.num_decodes
+            filter_index = paddle.nonzero(metadata.filter_mask[prefill_start:]).squeeze(-1)
+            metadata.prefill_seq_lens = paddle.gather(
+                metadata.active_seq_lens_encoder[prefill_start:], filter_index, axis=0
+            ).squeeze(-1)
+            metadata.prefill_block_tables = paddle.gather(
+                metadata.active_block_tables[prefill_start:], filter_index, axis=0
+            )
+            metadata.prefill_total_seq_len = paddle.gather(
+                metadata.active_total_seq_len[prefill_start:], filter_index, axis=0
+            )
+            metadata.prefill_cum_seq_lens_q = (
+                metadata.active_cu_seqlens_q[prefill_start:] - metadata.num_decode_tokens
+            )
+            metadata.prefill_cum_seq_lens_kv = metadata.cum_seq_lens_kv[prefill_start:]
+            metadata.prefill_max_q_len = paddle.max(
+                metadata.active_seq_lens_this_time[prefill_start:]
+            ).item()
+            metadata.prefill_max_kv_len = paddle.max(metadata.prefill_total_seq_len).item()
+
+        # 预计算 decode 动态索引（移出 forward_mixed 以兼容 CUDA Graph）
+        if metadata.num_decode_tokens > 0:
+            decode_end = metadata.num_decodes
+            decoder_filter_index = paddle.nonzero(metadata.filter_mask[:decode_end]).squeeze(-1)
+            metadata.decode_block_tables = paddle.gather(
+                metadata.active_block_tables[:decode_end], decoder_filter_index, axis=0
+            )
+            metadata.decode_total_seq_len = paddle.gather(
+                metadata.active_total_seq_len[:decode_end], decoder_filter_index, axis=0
+            ).squeeze(-1)
+
         # metadata.active_block_kv_indptr_gpu = paddle.cumsum(num_blocks)
         self.attention_metadata: AttentionMetadata = metadata
 
@@ -277,7 +324,7 @@ class TrtllmAttentionBackend(AttentionBackend):
         #     print(f"num_prefill_tokens:{metadata.num_prefill_tokens} ,metadata.num_decode_tokens:{metadata.num_decode_tokens} ,metadata.num_decodes:{metadata.num_decodes}, metadata.num_prefills:{metadata.num_prefills}")
 
         output = kwargs.get("output")
-        workspace_buffer = paddle.empty(394 * 1024 * 1024, dtype=paddle.int8)
+        workspace_buffer = self.workspace_buffer
         self.bmm1_scale = float(1.0 / (self.head_dim**0.5))
         if metadata.num_prefill_tokens > 0:
             # if layer.layer_id==0:
@@ -328,64 +375,29 @@ class TrtllmAttentionBackend(AttentionBackend):
             )
             prefill_start = metadata.num_decodes
             prefill_q = q[metadata.num_decode_tokens :]
-            assert (
-                metadata.active_seq_lens_encoder[prefill_start:].shape[0]
-                == metadata.filter_mask[prefill_start:].shape[0]
-            ), f"metadata.active_seq_lens_encoder[prefill_start:].shape:{metadata.active_seq_lens_encoder[prefill_start:].shape},metadata.filter_mask[prefill_start:].shape:{metadata.filter_mask[prefill_start:].shape}"
-            filter_index = paddle.nonzero(metadata.filter_mask[prefill_start:]).squeeze(-1)
-            seq_lens_prefill = paddle.gather(
-                metadata.active_seq_lens_encoder[prefill_start:], filter_index, axis=0
-            ).squeeze(-1)
-            # seq_lens_prefill = metadata.active_seq_lens_encoder[prefill_start:][metadata.filter_mask[prefill_start:]]
-            cum_seq_lens_q = metadata.active_cu_seqlens_q[prefill_start:]
-            cum_seq_lens_q = cum_seq_lens_q - metadata.num_decode_tokens
             out = output[metadata.num_decode_tokens :]
-            mock_block_tables_prefill = paddle.gather(
-                metadata.active_block_tables[prefill_start:], filter_index, axis=0
-            )
-            # mock_block_tables_prefill = metadata.active_block_tables[prefill_start:][
-            #     metadata.filter_mask[prefill_start:]
-            # ]
-            cum_seq_lens_kv = metadata.cum_seq_lens_kv[prefill_start:]
-            # decoder_sum = 0 if prefill_start==0 else metadata.cum_seq_lens_kv[prefill_start]
-            # cum_seq_lens_kv = cum_seq_lens_kv - decoder_sum
-            total_seq_len = paddle.gather(metadata.active_total_seq_len[prefill_start:], filter_index, axis=0)
-            # total_seq_len = metadata.active_total_seq_len[prefill_start:][metadata.filter_mask[prefill_start:]]
-            max_q_len = paddle.max(metadata.active_seq_lens_this_time[prefill_start:])
-            max_kv_len = paddle.max(total_seq_len)
 
-            # prefill_q = prefill_q.contiguous()
-            # seq_lens_prefill = seq_lens_prefill.contiguous()
-            # cum_seq_lens_q = cum_seq_lens_q.contiguous()
-
-            # assert prefill_q.is_contiguous()
-            # assert forward_meta.caches[2 * layer.layer_id].is_contiguous()
-            # assert forward_meta.caches[2 * layer.layer_id + 1].is_contiguous()
-            # assert workspace_buffer.is_contiguous()
-            # assert mock_block_tables_prefill.is_contiguous()
-            # assert seq_lens_prefill.is_contiguous()
             if layer.layer_id == 0:
                 print("running prefill")
                 print("prefill_q", prefill_q.shape)
-                print("mock_block_tables_prefill:", mock_block_tables_prefill)
-                print("seq_lens_prefill:", seq_lens_prefill)
-                # print("cu_seqlens_q:",cu_seqlens_q)
-                print("cum_seq_lens_q:", cum_seq_lens_q)
-                print("cum_seq_lens_kv:", cum_seq_lens_kv)
+                print("mock_block_tables_prefill:", metadata.prefill_block_tables)
+                print("seq_lens_prefill:", metadata.prefill_seq_lens)
+                print("cum_seq_lens_q:", metadata.prefill_cum_seq_lens_q)
+                print("cum_seq_lens_kv:", metadata.prefill_cum_seq_lens_kv)
 
             trtllm_batch_context_with_kv_cache(
                 query=prefill_q,
                 kv_cache=(forward_meta.caches[2 * layer.layer_id], forward_meta.caches[2 * layer.layer_id + 1]),
                 workspace_buffer=workspace_buffer,
-                block_tables=mock_block_tables_prefill,
-                seq_lens=seq_lens_prefill,
-                max_q_len=max_q_len.item(),
-                max_kv_len=max_kv_len.item(),
+                block_tables=metadata.prefill_block_tables,
+                seq_lens=metadata.prefill_seq_lens,
+                max_q_len=metadata.prefill_max_q_len,
+                max_kv_len=metadata.prefill_max_kv_len,
                 bmm1_scale=self.bmm1_scale,
                 bmm2_scale=1.0,
                 batch_size=metadata.num_prefills,
-                cum_seq_lens_q=cum_seq_lens_q,
-                cum_seq_lens_kv=cum_seq_lens_kv,
+                cum_seq_lens_q=metadata.prefill_cum_seq_lens_q,
+                cum_seq_lens_kv=metadata.prefill_cum_seq_lens_kv,
                 # window_left=-1,
                 out=out,
                 # nvfp4
@@ -422,49 +434,38 @@ class TrtllmAttentionBackend(AttentionBackend):
                 None,  # k_norm_weight
                 1e-6,
                 "none",
-                False,  # use_neox_rotary_style
+                layer.use_neox_rotary_style,  # use_neox_rotary_style
                 False,
                 self.max_seq_len,
                 0.0,  # quant_max_bound
                 0.0,  # quant_min_bound
                 False,  # speculate_decoder
             )
-            decode_end = metadata.num_decodes
             decode_q = qkv_out[:, : self.num_heads * self.head_dim][: metadata.num_decode_tokens].reshape(
                 [-1, self.num_heads, self.head_dim]
             )
             decode_q = decode_q.contiguous()
-            decoder_filter_index = paddle.nonzero(metadata.filter_mask[:decode_end]).squeeze(-1)
-            mock_block_tables_decode = paddle.gather(
-                metadata.active_block_tables[:decode_end], decoder_filter_index, axis=0
-            )
-            # mock_block_tables_decode = metadata.active_block_tables[:decode_end][metadata.filter_mask[:decode_end]]
-            total_seq_len = paddle.gather(
-                metadata.active_total_seq_len[:decode_end], decoder_filter_index, axis=0
-            ).squeeze(-1)
-            # total_seq_len = metadata.active_total_seq_len[:decode_end][metadata.filter_mask[:decode_end]]
             out = output[: metadata.num_decode_tokens]
-            # max_seq_len = paddle.max(total_seq_len)
 
-            # if layer.layer_id==0:
-            #     print("qkv:",qkv)
-            #     print("v:",qkv.reshape([-1,self.head_dim * (self.num_heads+2*self.kv_num_heads)])[:,-self.kv_num_heads*self.head_dim:])
-            #     print('trtllm_batch_decode_with_kv_cache')
-            #     print('decode_q', decode_q.shape)
-            #     print('mock_block_tables_decode:', mock_block_tables_decode)
-            #     print("total_seq_len:",total_seq_len)
-            #     print("max_seq_len.item():",max_seq_len.item())
-            #     print("self.max_seq_len:",self.max_seq_len)
-
-            # paddle.save({"cache_k":forward_meta.caches[2 * layer.layer_id]}, "/workspace3/tbh/FastDeploy/decode_cache/cache_k.pdparams")
-            # paddle.save({"cache_v":forward_meta.caches[2 * layer.layer_id + 1]}, "/workspace3/tbh/FastDeploy/decode_cache/cache_v.pdparams")
+            if forward_meta.step_use_cudagraph:
+                # CUDA Graph 路径：直接使用 forward_meta 预分配 buffer（地址恒定）
+                # 避免使用 metadata 中 gather 出来的 tensor（每次地址不同，graph replay 读旧地址）
+                decode_block_tables = forward_meta.block_tables[: metadata.num_decode_tokens]
+                decode_seq_lens = (
+                    forward_meta.seq_lens_decoder[: metadata.num_decode_tokens]
+                    + forward_meta.seq_lens_this_time[: metadata.num_decode_tokens]
+                ).squeeze(-1)
+            else:
+                # 非 CUDA Graph 路径：使用预计算的过滤结果
+                decode_block_tables = metadata.decode_block_tables
+                decode_seq_lens = metadata.decode_total_seq_len
 
             trtllm_batch_decode_with_kv_cache(
                 query=decode_q,
                 kv_cache=(forward_meta.caches[2 * layer.layer_id], forward_meta.caches[2 * layer.layer_id + 1]),
                 workspace_buffer=workspace_buffer,
-                block_tables=mock_block_tables_decode,
-                seq_lens=total_seq_len,
+                block_tables=decode_block_tables,
+                seq_lens=decode_seq_lens,
                 max_seq_len=self.max_seq_len,
                 bmm1_scale=self.bmm1_scale,
                 bmm2_scale=1.0,
