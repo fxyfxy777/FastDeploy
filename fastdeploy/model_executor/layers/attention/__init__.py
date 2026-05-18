@@ -23,6 +23,7 @@ from .flash_mask_attn_backend import FlashMaskAttentionBackend
 from .mla_attention_backend import MLAAttentionBackend
 from .moba_attention_backend import PlasAttentionBackend
 from .native_paddle_backend import PaddleNativeAttnBackend
+from .trtllm_noreorder_backend import TrtllmNoReorderAttentionBackend
 
 __all__ = [
     "AttentionBackend",
@@ -36,4 +37,5 @@ __all__ = [
     "Attention",
     "PlasAttentionBackend",
     "FlashMaskAttentionBackend",
+    "TrtllmNoReorderAttentionBackend",
 ]
