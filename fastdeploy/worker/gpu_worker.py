@@ -235,6 +235,13 @@ class GpuWorker(WorkerBase):
         if self.fd_config.graph_opt_config.graph_opt_level >= 1:
             self.model_runner.vision_encoder_compile()
 
+        # Auto attention backend: run offline benchmark before CUDAGraph capture
+        from fastdeploy.model_executor.layers.attention.auto_attn_backend import AutoAttentionBackend
+        for attn_backend in self.model_runner.attn_backends:
+            if isinstance(attn_backend, AutoAttentionBackend):
+                attn_backend.run_benchmark(self.fd_config)
+                break
+
         # Static split graph mode: capture CUDAGraph for prefill/mixed phase
         if (
             self.fd_config.graph_opt_config.graph_opt_level >= 1

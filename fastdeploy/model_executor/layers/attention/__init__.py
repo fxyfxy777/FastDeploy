@@ -15,6 +15,7 @@
 from .append_attn_backend import AppendAttentionBackend
 from .attention import Attention
 from .attention_selecter import get_attention_backend
+from .auto_attn_backend import AutoAttentionBackend
 from .base_attention_backend import AttentionBackend
 from .block_multihead_attn_backend import BlockAttentionBackend
 from .dsa_attention_backend import DSAAttentionBackend
@@ -36,4 +37,5 @@ __all__ = [
     "Attention",
     "PlasAttentionBackend",
     "FlashMaskAttentionBackend",
+    "AutoAttentionBackend",
 ]
