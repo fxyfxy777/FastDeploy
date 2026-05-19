@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import paddle
 
 from fastdeploy.config import FDConfig
+from fastdeploy import envs
 from fastdeploy.model_executor.layers.attention.attention import Attention
 from fastdeploy.model_executor.layers.attention.base_attention_backend import (
     AttentionBackend,
@@ -96,7 +97,7 @@ class TrtllmNoReorderAttentionBackend(AttentionBackend):
     attention_metadata: TrtllmNoReorderAttentionMetadata
     flash_attn_func: callable = None
     use_output: bool = True
-    enable_ids_reorder: bool = False
+    enable_ids_reorder: bool = envs.FD_PD_REORDER
 
     def __init__(
         self,
@@ -169,7 +170,10 @@ class TrtllmNoReorderAttentionBackend(AttentionBackend):
         """Initialize attention metadata from forward_meta."""
         metadata = TrtllmNoReorderAttentionMetadata()
 
-        num_running_requests = forward_meta.seq_lens_this_time.shape[0]
+        # Use actual running request count (slots with seq_lens_this_time > 0),
+        # not buffer size. Since enable_ids_reorder=False, requests are compacted
+        # to the front by the scheduler, so we can use the count as slice boundary.
+        num_running_requests = int((forward_meta.seq_lens_this_time.squeeze(-1) > 0).sum().item())
         metadata.num_running_requests = num_running_requests
         metadata.batch_size = num_running_requests
 
@@ -241,9 +245,8 @@ class TrtllmNoReorderAttentionBackend(AttentionBackend):
             # Context kernel params (for prefill or mixed batch)
             metadata.cum_seq_lens_q = forward_meta.cu_seqlens_q[:num_running_requests + 1]
 
-            # cum_seq_lens_kv: prefix sum of block counts (block-level indptr)
-            num_blocks = (total_seq_len + (self.block_size - 1)) // self.block_size
-            self.block_kv_indptr_gpu[1:num_running_requests + 1] = paddle.cumsum(num_blocks)
+            # cum_seq_lens_kv: token-level cumulative kv lengths
+            self.block_kv_indptr_gpu[1:num_running_requests + 1] = paddle.cumsum(total_seq_len.squeeze(-1))
             metadata.cum_seq_lens_kv = self.block_kv_indptr_gpu[:num_running_requests + 1]
 
             metadata.block_tables = forward_meta.block_tables[:num_running_requests]
