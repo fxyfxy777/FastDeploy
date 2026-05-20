@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-import time
+import statistics
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,17 +85,24 @@ class AutotuneCache:
         for backend in self.candidates:
             # warmup
             backend.forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
-            paddle.device.cuda.synchronize()
-            # timed run
-            start = time.perf_counter()
-            backend.forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
-            paddle.device.cuda.synchronize()
-            elapsed = time.perf_counter() - start
+            paddle.cuda.synchronize()
+            # timed run: 10 iterations, take median of middle 5
+            times = []
+            for _ in range(10):
+                start_event = paddle.cuda.Event(enable_timing=True)
+                end_event = paddle.cuda.Event(enable_timing=True)
+                start_event.record()
+                backend.forward_mixed(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta)
+                end_event.record()
+                paddle.cuda.synchronize()
+                times.append(start_event.elapsed_time(end_event))
+            times.sort()
+            elapsed = statistics.median(times[2:7])
             results.append((elapsed, backend))
 
         best = min(results, key=lambda x: x[0])[1]
         self.cache[key] = best
-        detail = ", ".join(f"{type(b).__name__}={t*1000:.3f}ms" for t, b in results)
+        detail = ", ".join(f"{type(b).__name__}={t:.3f}ms" for t, b in results)
         logger.info(f"AutoAttn tune key={key}: {detail} -> best={type(best).__name__}")
         return best
 
