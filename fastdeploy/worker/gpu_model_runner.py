@@ -2317,6 +2317,16 @@ class GPUModelRunner(ModelRunnerBase):
             self._cached_post_process_event.synchronize()
             if self.routing_replay_manager is not None:
                 self.routing_replay_manager.flush_pending_save()
+            # DEBUG: check if any tensor is on GPU
+            _so = self._cached_sampler_output
+            if _so.logprobs_tensors is not None:
+                _lp = _so.logprobs_tensors
+                print(f"[DEBUG save_output] logprob_token_ids.place={_lp.logprob_token_ids.place}, "
+                      f"logprobs.place={_lp.logprobs.place}, "
+                      f"selected_token_ranks.place={_lp.selected_token_ranks.place}")
+            if _so.logz_per_batch is not None:
+                print(f"[DEBUG save_output] logz_per_batch.place={_so.logz_per_batch.place}")
+            print(f"[DEBUG save_output] not_need_stop.place={self._cached_model_output_data.not_need_stop.place}")
             self._save_model_output(
                 self._cached_model_output_data,
                 self._cached_sampler_output,
@@ -2538,8 +2548,12 @@ class GPUModelRunner(ModelRunnerBase):
                     and not envs.FD_USE_GET_SAVE_OUTPUT_V1
                     and sampler_output.logprobs_tensors is None
                 ):
+                    logprob_token_ids_cpu = paddle.empty_like(
+                        sampler_output.sampled_token_ids, device="cpu"
+                    ).pin_memory()
+                    logprob_token_ids_cpu.copy_(sampler_output.sampled_token_ids, False)
                     sampler_output.logprobs_tensors = LogprobsTensors(
-                        logprob_token_ids=sampler_output.sampled_token_ids,
+                        logprob_token_ids=logprob_token_ids_cpu,
                         logprobs=paddle.empty_like(sampler_output.sampled_token_ids, device="cpu", dtype="float32"),
                         selected_token_ranks=paddle.empty(
                             [sampler_output.sampled_token_ids.shape[0]], device="cpu", dtype="int64"
@@ -2660,6 +2674,10 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["accept_num_cpu"].copy_(self.share_inputs["accept_num"], False)
                 self.share_inputs["seq_lens_decoder_cpu"].copy_(self.share_inputs["seq_lens_decoder"], False)
                 self.share_inputs["prompt_lens_cpu"].copy_(self.share_inputs["prompt_lens"], False)
+            if sampler_output.logz_per_batch is not None:
+                logz_cpu = paddle.empty_like(sampler_output.logz_per_batch, device="cpu").pin_memory()
+                logz_cpu.copy_(sampler_output.logz_per_batch, False)
+                sampler_output.logz_per_batch = logz_cpu
             post_process_event.record()
 
             # 6. Speculative decode -- proposer run (method="naive" has proposer=None, skip)

@@ -227,10 +227,15 @@ def logprobs_renormalize_with_logz(logprobs: paddle.Tensor, logz, logprobs_tenso
               Can be np.ndarray or paddle.Tensor (CPU pinned memory).
         logprobs_tensors: LogprobsTensors
     """
+    # Ensure logprobs is plain CPU for arithmetic (CUDAPinned -> CPU is free, no data copy).
+    if isinstance(logprobs.place, paddle.CUDAPinnedPlace):
+        logprobs = logprobs.cpu()
     if isinstance(logz, paddle.Tensor):
+        if isinstance(logz.place, paddle.CUDAPinnedPlace):
+            logz = logz.cpu()
         logz = logz.astype(logprobs.dtype)
     else:
-        logz = paddle.to_tensor(logz, dtype=logprobs.dtype)
+        logz = paddle.to_tensor(logz, dtype=logprobs.dtype, place=paddle.CPUPlace())
     # Renormalize: log π_masked = log π_full - log Z_K
     # Only normalize valid candidates; padding positions use -inf
     valid_mask = paddle.isfinite(logprobs)
